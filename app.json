@@ -1,7 +1,7 @@
 {
   "expo": {
-    "name": "planner-app",
-    "slug": "planner-app",
+    "name": "MoofToDo",
+    "slug": "MoofToDo",
     "version": "1.0.0",
     "orientation": "portrait",
     "icon": "./assets/images/icon.png",
@@ -43,6 +43,10 @@
     "experiments": {
       "typedRoutes": true,
       "reactCompiler": true
+    },
+    "extra": {
+      "EXPO_PUBLIC_SUPABASE_URL": "https://hdevnfdpishzslgkhhpa.supabase.co",
+      "EXPO_PUBLIC_SUPABASE_ANON_KEY": "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6ImhkZXZuZmRwaXNoenNsZ2toaHBhIiwicm9sZSI6ImFub24iLCJpYXQiOjE3NjQ3NDgwNDMsImV4cCI6MjA4MDMyNDA0M30._lobDrDO-M1bdfEn0TvKCktJhPcvWnN-3jZj8eYHA_0"
     }
   }
 }
