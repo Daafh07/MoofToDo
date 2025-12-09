@@ -3,6 +3,7 @@ import { StatusBar } from 'expo-status-bar';
 import React, { useEffect, useMemo, useRef, useState } from 'react';
 import {
   ActivityIndicator,
+  Platform,
   Pressable,
   ScrollView,
   StyleSheet,
@@ -11,9 +12,7 @@ import {
   TouchableOpacity,
   useWindowDimensions,
   View,
-  Platform,
 } from 'react-native';
-import { SafeAreaView } from 'react-native-safe-area-context';
 import Animated, {
   FadeIn,
   FadeInDown,
@@ -22,6 +21,7 @@ import Animated, {
   ZoomIn,
   ZoomOut,
 } from 'react-native-reanimated';
+import { SafeAreaView } from 'react-native-safe-area-context';
 import { supabase } from '../lib/supabase';
 
 type Session = Awaited<ReturnType<typeof supabase.auth.getSession>>['data']['session'];
@@ -1574,7 +1574,77 @@ function NotesView({
   const [richLib, setRichLib] = useState<{ RichEditor: any; RichToolbar: any; actions: any } | null>(null);
   const richRef = useRef<any | null>(null);
   const webEditorRef = useRef<HTMLDivElement | null>(null);
-  const webSelection = useRef<Range | null>(null);
+  const savedWebRange = useRef<Range | null>(null);
+  const [inlineStates, setInlineStates] = useState({
+    bold: false,
+    italic: false,
+    underline: false,
+  });
+  const [webStates, setWebStates] = useState({
+    bold: false,
+    italic: false,
+    underline: false,
+    list: false,
+    h1: false,
+    h2: false,
+    highlight: false,
+  });
+  const HILITE_COLOR = '#fff59d';
+  const computeWebStates = () => {
+    const bold = document.queryCommandState('bold') || false;
+    const italic = document.queryCommandState('italic') || false;
+    const underline = document.queryCommandState('underline') || false;
+    const list = document.queryCommandState('insertUnorderedList') || false;
+    const block = (document.queryCommandValue('formatBlock') || '').toLowerCase();
+    const hilite = (document.queryCommandValue('hiliteColor') || '').toLowerCase();
+    const back = (document.queryCommandValue('backColor') || '').toLowerCase();
+    const highlight =
+      hilite === HILITE_COLOR ||
+      back === HILITE_COLOR ||
+      hilite === 'rgb(255, 245, 157)' ||
+      back === 'rgb(255, 245, 157)' ||
+      (hilite !== '' && hilite !== 'transparent' && hilite !== 'rgba(0, 0, 0, 0)' && hilite !== 'initial');
+    return {
+      bold,
+      italic,
+      underline,
+      list,
+      h1: block === 'h1',
+      h2: block === 'h2',
+      highlight,
+    };
+  };
+  const HIGHLIGHT_OPTIONS = [
+    '#fff59d', // geel
+    '#a5f3fc', // cyaan
+    '#bbf7d0', // groen
+    '#fed7aa', // oranje
+    '#fbcfe8', // roze
+    '#e0f2fe', // lichtblauw
+    '#fde68a', // amber
+    '#e5e7eb', // grijs
+  ];
+  const [showHighlightPicker, setShowHighlightPicker] = useState(false);
+  const captureSelection = () => {
+    if (isWeb) {
+      const sel = window.getSelection();
+      if (sel && sel.rangeCount > 0) {
+        const range = sel.getRangeAt(0);
+        if (webEditorRef.current?.contains(range.commonAncestorContainer)) {
+          savedWebRange.current = range.cloneRange();
+        }
+      }
+    }
+  };
+  const restoreSelection = () => {
+    if (!isWeb) return;
+    const sel = window.getSelection();
+    if (sel && savedWebRange.current) {
+      sel.removeAllRanges();
+      sel.addRange(savedWebRange.current);
+    }
+  };
+
   const isClient = typeof window !== 'undefined';
   const toPlainText = (html?: string | null) =>
     html ? html.replace(/<[^>]+>/g, '').replace(/\s+/g, ' ').trim() : '';
@@ -1594,19 +1664,26 @@ function NotesView({
 
   useEffect(() => {
     if (!isWeb) return;
-    const handleSelection = () => {
-      const sel = window.getSelection();
-      if (!sel || sel.rangeCount === 0) return;
+   const handleSelectionWithRange = () => {
+    const sel = window.getSelection();
+    if (sel && sel.rangeCount > 0) {
       const range = sel.getRangeAt(0);
       const editorEl = webEditorRef.current;
       if (editorEl && editorEl.contains(range.commonAncestorContainer)) {
-        webSelection.current = range.cloneRange();
+        savedWebRange.current = range.cloneRange();
+        // Only update non-inline states from the document; keep inline from inlineStates
+        const computed = computeWebStates();
+        setWebStates((prev) => ({ ...prev, ...computed }));
       }
-    };
-    document.addEventListener('selectionchange', handleSelection);
-    return () => document.removeEventListener('selectionchange', handleSelection);
+    }
+  };
+    document.addEventListener('selectionchange', handleSelectionWithRange);
+    return () => document.removeEventListener('selectionchange', handleSelectionWithRange);
   }, []);
 
+  // Hydrate content only when de modal opent of een andere note wordt geladen.
+  // deliberate lint disable: we willen noteBody NIET in deps om caret te behouden
+  // eslint-disable-next-line react-hooks/exhaustive-deps
   useEffect(() => {
     if (noteModalOpen) {
       if (!isWeb && richRef.current) {
@@ -1616,24 +1693,80 @@ function NotesView({
         webEditorRef.current.innerHTML = noteBody || '';
       }
     }
-  }, [noteModalOpen, noteBody, isWeb]);
+  }, [noteModalOpen, editingNote?.id, isWeb]);
+
+  const toggleWebHighlight = () => {
+    if (!isWeb) return;
+    const editor = webEditorRef.current;
+    if (!editor) return;
+    restoreSelection();
+    editor.focus();
+    // Always clear first, then re-apply if turning ON
+    document.execCommand('hiliteColor', false, 'transparent');
+    document.execCommand('backColor', false, 'transparent');
+    document.execCommand('hiliteColor', false, 'initial');
+    document.execCommand('backColor', false, 'initial');
+    if (!webStates.highlight) {
+      document.execCommand('hiliteColor', false, HILITE_COLOR);
+    }
+    const html = editor.innerHTML ?? '';
+    onChangeNoteBody(html);
+    setWebStates(computeWebStates());
+    captureSelection();
+  };
 
   const runWebCommand = (cmd: string, value?: string) => {
     if (!isWeb) return;
     try {
       const editor = webEditorRef.current;
       if (!editor) return;
+      restoreSelection();
       editor.focus();
-      const sel = window.getSelection();
-      if (webSelection.current && sel) {
-        sel.removeAllRanges();
-        sel.addRange(webSelection.current);
-      }
       document.execCommand(cmd, false, value);
       const html = editor.innerHTML ?? '';
       onChangeNoteBody(html);
+      setWebStates(computeWebStates());
+      captureSelection();
     } catch (e) {
       console.warn('web command failed', cmd, e);
+    }
+  };
+
+  const toggleInlineCommand = (cmd: 'bold' | 'italic' | 'underline') => {
+    if (!isWeb) return;
+    try {
+      const editor = webEditorRef.current;
+      if (!editor) return;
+      // Restore selection if we have it, otherwise place caret at end
+      if (savedWebRange.current) {
+        restoreSelection();
+      } else {
+        const range = document.createRange();
+        range.selectNodeContents(editor);
+        range.collapse(false);
+        const sel = window.getSelection();
+        sel?.removeAllRanges();
+        sel?.addRange(range);
+      }
+      editor.focus();
+      document.execCommand(cmd, false);
+      const html = editor.innerHTML ?? '';
+      onChangeNoteBody(html);
+      // Refresh states from the document (inline first for instant feedback)
+      const inlineState = document.queryCommandState(cmd) || false;
+      setWebStates((prev) => ({ ...prev, [cmd]: inlineState }));
+      const next = computeWebStates();
+      setWebStates((prev) => ({ ...prev, ...next }));
+      // Store current selection for later use
+      const selAfter = window.getSelection();
+      if (selAfter && selAfter.rangeCount > 0) {
+        const range = selAfter.getRangeAt(0);
+        if (editor.contains(range.commonAncestorContainer)) {
+          savedWebRange.current = range.cloneRange();
+        }
+      }
+    } catch (e) {
+      console.warn('inline command failed', cmd, e);
     }
   };
 
@@ -1644,7 +1777,6 @@ function NotesView({
         <View style={{ flexDirection: 'row', justifyContent: 'space-between', alignItems: 'center', marginBottom: 10 }}>
           <View>
             <Text style={styles.heroTitle}>{editingNote ? 'Edit Note' : 'New Note'}</Text>
-            <Text style={styles.subheading}>Volledige editor (Docs-stijl).</Text>
           </View>
           <View style={{ flexDirection: 'row', gap: 8 }}>
             <TouchableOpacity style={[styles.ghostButton, { paddingHorizontal: 14, height: 44 }]} onPress={onCloseNoteModal}>
@@ -1675,26 +1807,134 @@ function NotesView({
           <View style={{ marginTop: 14, marginBottom: 10 }}>
             <Text style={styles.inputLabel}>Toolbar</Text>
             {isWeb ? (
-              <ScrollView horizontal showsHorizontalScrollIndicator={false} contentContainerStyle={{ gap: 8, paddingVertical: 8 }}>
-                <Pressable style={styles.toolbarButton} onPress={() => runWebCommand('bold')}>
-                  <Text style={styles.toolbarButtonText}>B</Text>
-                </Pressable>
-                <Pressable style={styles.toolbarButton} onPress={() => runWebCommand('italic')}>
-                  <Text style={[styles.toolbarButtonText, { fontStyle: 'italic' }]}>i</Text>
-                </Pressable>
-                <Pressable style={styles.toolbarButton} onPress={() => runWebCommand('underline')}>
-                  <Text style={[styles.toolbarButtonText, { textDecorationLine: 'underline' }]}>U</Text>
-                </Pressable>
-                <Pressable style={styles.toolbarButton} onPress={() => runWebCommand('insertUnorderedList')}>
-                  <Text style={styles.toolbarButtonText}>• List</Text>
-                </Pressable>
-                <Pressable style={styles.toolbarButton} onPress={() => runWebCommand('formatBlock', 'h1')}>
-                  <Text style={styles.toolbarButtonText}>H1</Text>
-                </Pressable>
-                <Pressable style={styles.toolbarButton} onPress={() => runWebCommand('formatBlock', 'h2')}>
-                  <Text style={styles.toolbarButtonText}>H2</Text>
-                </Pressable>
-              </ScrollView>
+              <View style={{ position: 'relative', overflow: 'visible', zIndex: 9998 }}>
+                <ScrollView
+                  horizontal
+                  showsHorizontalScrollIndicator={false}
+                  style={{ overflow: 'visible' }}
+                  contentContainerStyle={{ gap: 8, paddingVertical: 8 }}>
+                  <Pressable
+                    style={[styles.toolbarButton, webStates.bold && { backgroundColor: '#e5e7ff', borderColor: ACCENT }]}
+                    onPressIn={(e) => {
+                      e.preventDefault?.();
+                      toggleInlineCommand('bold');
+                    }}>
+                    <Text style={styles.toolbarButtonText}>B</Text>
+                  </Pressable>
+                  <Pressable
+                    style={[styles.toolbarButton, webStates.italic && { backgroundColor: '#e5e7ff', borderColor: ACCENT }]}
+                    onPressIn={(e) => {
+                      e.preventDefault?.();
+                      toggleInlineCommand('italic');
+                    }}>
+                    <Text style={[styles.toolbarButtonText, { fontStyle: 'italic' }]}>i</Text>
+                  </Pressable>
+                  <Pressable
+                    style={[styles.toolbarButton, webStates.underline && { backgroundColor: '#e5e7ff', borderColor: ACCENT }]}
+                    onPressIn={(e) => {
+                      e.preventDefault?.();
+                      toggleInlineCommand('underline');
+                    }}>
+                    <Text style={[styles.toolbarButtonText, { textDecorationLine: 'underline' }]}>U</Text>
+                  </Pressable>
+                  <Pressable
+                    style={[styles.toolbarButton, webStates.list && { backgroundColor: '#e5e7ff', borderColor: ACCENT }]}
+                    onPressIn={(e) => {
+                      e.preventDefault?.();
+                      runWebCommand('insertUnorderedList');
+                    }}>
+                    <Text style={styles.toolbarButtonText}>• List</Text>
+                  </Pressable>
+                  <View style={{ position: 'relative', flexDirection: 'row', alignItems: 'center', gap: 8, paddingRight: 8 }}>
+                    <Pressable
+                      style={[styles.toolbarButton, webStates.highlight && { backgroundColor: '#fde68a', borderColor: '#f59e0b' }]}
+                      onPressIn={(e) => {
+                        e.preventDefault?.();
+                        toggleWebHighlight();
+                      }}>
+                      <Text style={[styles.toolbarButtonText, { color: '#9a3412' }]}>Highlight</Text>
+                    </Pressable>
+                    <Pressable
+                      style={[
+                        styles.colorDot,
+                        {
+                          backgroundColor: HILITE_COLOR,
+                          height: 28,
+                          width: 28,
+                          borderRadius: 14,
+                          borderWidth: webStates.highlight ? 2 : 1,
+                          borderColor: webStates.highlight ? '#111827' : '#e5e7eb',
+                        },
+                      ]}
+                      onPressIn={(e) => {
+                        e.preventDefault?.();
+                        setShowHighlightPicker((prev) => !prev);
+                      }}
+                    />
+                    {showHighlightPicker ? (
+                      <View style={[styles.dropdown, { top: 52, left: 0 }]}>
+                        <View style={{ flexDirection: 'column', gap: 10 }}>
+                          {HIGHLIGHT_OPTIONS.map((color) => (
+                            <Pressable
+                              key={color}
+                              style={[
+                                styles.colorDot,
+                                {
+                                  backgroundColor: color,
+                                  height: 26,
+                                  width: 26,
+                                  borderRadius: 13,
+                                  borderWidth:
+                                    color.toLowerCase() === HILITE_COLOR.toLowerCase() && webStates.highlight
+                                      ? 2
+                                      : 1,
+                                  borderColor:
+                                    color.toLowerCase() === HILITE_COLOR.toLowerCase() && webStates.highlight
+                                      ? '#111827'
+                                      : '#e5e7eb',
+                                },
+                              ]}
+                              onPressIn={(e) => {
+                                e.preventDefault?.();
+                                const editor = webEditorRef.current;
+                                if (!editor) return;
+                                restoreSelection();
+                                editor.focus();
+                                document.execCommand('hiliteColor', false, 'transparent');
+                                document.execCommand('backColor', false, 'transparent');
+                                document.execCommand('hiliteColor', false, color);
+                                const html = editor.innerHTML ?? '';
+                                onChangeNoteBody(html);
+                                setWebStates((prev) => ({ ...prev, highlight: true }));
+                                captureSelection();
+                                setShowHighlightPicker(false);
+                              }}
+                            />
+                          ))}
+                        </View>
+                      </View>
+                    ) : null}
+                  </View>
+                  <Pressable
+                    style={[styles.toolbarButton, webStates.h1 && { backgroundColor: '#e5e7ff', borderColor: ACCENT }]}
+                    onPressIn={(e) => {
+                      e.preventDefault?.();
+                      const nextBlock = webStates.h1 ? 'p' : 'h1';
+                      runWebCommand('formatBlock', nextBlock);
+                    }}>
+                    <Text style={styles.toolbarButtonText}>H1</Text>
+                  </Pressable>
+                  <Pressable
+                    style={[styles.toolbarButton, webStates.h2 && { backgroundColor: '#e5e7ff', borderColor: ACCENT }]}
+                    onPressIn={(e) => {
+                      e.preventDefault?.();
+                      const nextBlock = webStates.h2 ? 'p' : 'h2';
+                      runWebCommand('formatBlock', nextBlock);
+                    }}>
+                    <Text style={styles.toolbarButtonText}>H2</Text>
+                  </Pressable>
+                </ScrollView>
+              </View>
             ) : richLib?.RichToolbar && richLib?.actions ? (
               <richLib.RichToolbar
                 editor={richRef as any}
@@ -1731,47 +1971,87 @@ function NotesView({
             )}
           </View>
 
-          <View style={{ gap: 10 }}>
+          <View style={{ gap: 12, backgroundColor: '#f5f7fb', paddingVertical: 18, paddingHorizontal: 12, borderRadius: 18 }}>
             <Text style={styles.inputLabel}>Content</Text>
-            <View style={[styles.docPage, { minHeight: 420, padding: 0 }]}>
-              {isWeb ? (
-                <div
-                  ref={webEditorRef}
-                  contentEditable
-                  suppressContentEditableWarning
-                  onInput={(e) => onChangeNoteBody((e.currentTarget as HTMLDivElement).innerHTML)}
-                  dangerouslySetInnerHTML={{ __html: noteBody }}
+            {isWeb ? (
+              <div
+                ref={webEditorRef}
+                contentEditable
+                suppressContentEditableWarning
+                onKeyUp={() => {
+                  try {
+                    const sel = window.getSelection();
+                    if (sel && sel.rangeCount > 0) {
+                      const range = sel.getRangeAt(0);
+                      if (webEditorRef.current?.contains(range.commonAncestorContainer)) {
+                        savedWebRange.current = range.cloneRange();
+                      }
+                    }
+                  } catch {
+                    //
+                  }
+                }}
+                onMouseUp={() => {
+                  try {
+                    const sel = window.getSelection();
+                    if (sel && sel.rangeCount > 0) {
+                      const range = sel.getRangeAt(0);
+                      if (webEditorRef.current?.contains(range.commonAncestorContainer)) {
+                        savedWebRange.current = range.cloneRange();
+                      }
+                    }
+                  } catch {
+                    //
+                  }
+                }}
+                  onInput={(e) => {
+                    const html = (e.currentTarget as HTMLDivElement).innerHTML;
+                    onChangeNoteBody(html);
+                  }}
                   style={{
-                    minHeight: 400,
-                    padding: 12,
+                    minHeight: 760,
+                    padding: '28px',
+                    width: '100%',
+                    maxWidth: 720,
+                    margin: '0 auto',
                     backgroundColor: '#fff',
-                    borderRadius: 24,
+                    borderRadius: 14,
                     outline: 'none',
                     fontSize: 16,
-                    lineHeight: 1.5,
-                    color: '#111827',
+                    lineHeight: 1.7,
+                    fontFamily: 'Arial, sans-serif',
+                    color: '#0f172a',
                     cursor: 'text',
-                  }}
-                />
-              ) : richLib?.RichEditor ? (
-                <richLib.RichEditor
-                  ref={richRef as any}
-                  initialContentHTML={noteBody}
-                  placeholder="Start writing zoals Google Docs..."
-                  onChange={(html: string) => onChangeNoteBody(html || '')}
-                  editorStyle={{
-                    backgroundColor: '#fff',
-                    color: '#111827',
-                    placeholderColor: '#9ca3af',
-                  }}
-                  style={{ minHeight: 400, borderRadius: 24, padding: 12 }}
-                />
-              ) : (
-                <Text style={{ padding: 12, color: '#6b7280' }}>
-                  Editor wordt geladen...
-                </Text>
-              )}
-            </View>
+                    whiteSpace: 'pre-wrap',
+                    wordBreak: 'break-word',
+                    textAlign: 'left',
+                  display: 'block',
+                  boxShadow: '0 8px 20px rgba(15,23,42,0.08)',
+                }}
+              />
+            ) : (
+              <View style={[styles.docPage, { minHeight: 420, padding: 0 }]}>
+                {richLib?.RichEditor ? (
+                  <richLib.RichEditor
+                    ref={richRef as any}
+                    initialContentHTML={noteBody}
+                    placeholder="Start writing zoals Google Docs..."
+                    onChange={(html: string) => onChangeNoteBody(html || '')}
+                    editorStyle={{
+                      backgroundColor: '#fff',
+                      fontFamily: 'Arial',
+                      color: '#111827',
+                      placeholderColor: '#9ca3af',
+                    }}
+                    style={{ minHeight: 400, borderRadius: 24, padding: 12 }}
+                  />
+                ) : (
+                  <Text style={{ padding: 12, color: '#6b7280' }}>
+                    Editor wordt geladen...
+                  </Text>
+                )}
+              </View>
+            )}
           </View>
 
           <View style={{ marginTop: 12 }}>
@@ -2401,6 +2681,27 @@ const styles = StyleSheet.create({
     fontWeight: '700',
     color: '#111827',
   },
+  dropdown: {
+    position: 'absolute',
+    top: 56,
+    left: 0,
+    backgroundColor: '#fff',
+    borderRadius: 12,
+    paddingHorizontal: 12,
+    paddingVertical: 14,
+    borderWidth: 1,
+    borderColor: '#e5e7eb',
+    flexDirection: 'column',
+    gap: 10,
+    zIndex: 99999,
+    minWidth: 220,
+    maxWidth: 340,
+    shadowColor: '#0f172a',
+    shadowOpacity: 0.12,
+    shadowOffset: { width: 0, height: 12 },
+    shadowRadius: 16,
+    elevation: 12,
+  },
   ghostButton: {
     flexDirection: 'row',
     alignItems: 'center',
@@ -2638,9 +2939,82 @@ const styles = StyleSheet.create({
     borderRadius: 14,
     borderWidth: 1,
     borderColor: BORDER,
+    overflow: 'visible',
     shadowColor: '#0f172a',
     shadowOpacity: 0.06,
     shadowOffset: { width: 0, height: 8 },
     shadowRadius: 12,
+    maxWidth: 980,
+    alignSelf: 'center',
+  },
+  docsShell: {
+    backgroundColor: '#e9eef5',
+    borderRadius: 16,
+    padding: 14,
+    gap: 12,
+    alignItems: 'center',
+  },
+  docsTopbar: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    justifyContent: 'space-between',
+    paddingHorizontal: 6,
+  },
+  docsTitle: {
+    fontSize: 20,
+    fontWeight: '700',
+    color: '#0f172a',
+  },
+  docsBadge: {
+    backgroundColor: '#dbeafe',
+    paddingHorizontal: 10,
+    paddingVertical: 4,
+    borderRadius: 999,
+  },
+  docsBadgeText: {
+    color: '#1d4ed8',
+    fontWeight: '700',
+    fontSize: 12,
+  },
+  docsChip: {
+    backgroundColor: '#fff',
+    paddingHorizontal: 10,
+    paddingVertical: 6,
+    borderRadius: 10,
+    borderWidth: 1,
+    borderColor: '#e5e7eb',
+  },
+  docsChipText: {
+    color: '#111827',
+    fontWeight: '600',
+  },
+  docsToolbarRow: {
+    paddingHorizontal: 4,
+    paddingVertical: 6,
+    gap: 8,
+  },
+  docsButton: {
+    paddingHorizontal: 14,
+    paddingVertical: 10,
+    borderRadius: 12,
+    backgroundColor: '#fff',
+    borderWidth: 1,
+    borderColor: '#e5e7eb',
+  },
+  docsButtonActive: {
+    borderColor: '#1d4ed8',
+    backgroundColor: '#e0e7ff',
+  },
+  docsButtonText: {
+    fontWeight: '700',
+    color: '#1f2937',
+  },
+  docsPageContainer: {
+    backgroundColor: '#e5eaf1',
+    borderRadius: 16,
+    paddingVertical: 18,
+    paddingHorizontal: 18,
+    overflow: 'hidden',
+    alignItems: 'center',
   },
 });

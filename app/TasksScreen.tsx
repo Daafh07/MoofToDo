@@ -157,3 +157,5 @@ export function TasksScreen({ onSignOut }: Props) {
     </View>
   );
 }
+
+export default TasksScreen;
