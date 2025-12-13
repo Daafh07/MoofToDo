@@ -165,6 +165,26 @@
     line-height: 1.75 !important;
   }
 
+  .print-note-content img {
+    max-width: 100% !important;
+    height: auto !important;
+    display: inline-block !important;
+    margin: 12px auto !important;
+    page-break-inside: avoid !important;
+  }
+
+  .print-note-content img[style*="float: left"] {
+    float: left !important;
+    margin: 12px 16px 12px 0 !important;
+    display: inline-block !important;
+  }
+
+  .print-note-content img[style*="float: right"] {
+    float: right !important;
+    margin: 12px 0 12px 16px !important;
+    display: inline-block !important;
+  }
+
   .print-note-content strong {
     font-weight: 600 !important;
     color: #0f172a !important;

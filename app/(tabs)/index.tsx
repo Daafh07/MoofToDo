@@ -3581,6 +3581,7 @@ function NotesView({
   const webFileInputRef = useRef<HTMLInputElement | null>(null);
   const savedWebRange = useRef<Range | null>(null);
   const [selectedImage, setSelectedImage] = useState<HTMLImageElement | null>(null);
+  const lastSelectedImageRef = useRef<HTMLImageElement | null>(null);
   const DEFAULT_IMAGE_WIDTH = 260;
   type WebStates = {
     bold: boolean;
@@ -3744,29 +3745,53 @@ function NotesView({
   };
 
   const adjustImageSize = (delta: number) => {
-    if (!selectedImage) return;
+    const target = selectedImage || lastSelectedImageRef.current;
+    if (!target) return;
     const currentWidth =
-      parseFloat(selectedImage.style.width || '') || selectedImage.getBoundingClientRect().width || DEFAULT_IMAGE_WIDTH;
+      parseFloat(target.style.width || '') || target.getBoundingClientRect().width || DEFAULT_IMAGE_WIDTH;
     const nextWidth = Math.max(120, Math.min(900, currentWidth + delta));
-    selectedImage.style.width = `${nextWidth}px`;
-    selectedImage.style.maxWidth = '100%';
-    selectedImage.style.height = 'auto';
-    selectedImage.style.display = selectedImage.style.float === 'none' ? 'block' : 'inline-block';
-    selectedImage.style.margin = selectedImage.style.float === 'left'
+    target.style.width = `${nextWidth}px`;
+    target.style.maxWidth = '100%';
+    target.style.height = 'auto';
+    target.style.display = target.style.float === 'none' ? 'block' : 'inline-block';
+    target.style.margin = target.style.float === 'left'
       ? '12px 16px 12px 0'
-      : selectedImage.style.float === 'right'
+      : target.style.float === 'right'
         ? '12px 0 12px 16px'
         : '12px auto';
-    selectedImage.setAttribute('data-moof-size', '1');
+    target.setAttribute('data-moof-size', '1');
     if (webEditorRef.current) {
       onChangeNoteBody(webEditorRef.current.innerHTML ?? '');
     }
   };
 
   const resetImageSize = () => {
-    adjustImageSize(DEFAULT_IMAGE_WIDTH - (selectedImage
-      ? parseFloat(selectedImage.style.width || '') || selectedImage.getBoundingClientRect().width || DEFAULT_IMAGE_WIDTH
+    const target = selectedImage || lastSelectedImageRef.current;
+    adjustImageSize(DEFAULT_IMAGE_WIDTH - (target
+      ? parseFloat(target.style.width || '') || target.getBoundingClientRect().width || DEFAULT_IMAGE_WIDTH
       : DEFAULT_IMAGE_WIDTH));
+  };
+
+  const setImageFloat = (dir: 'left' | 'right' | 'none') => {
+    const target = selectedImage || lastSelectedImageRef.current;
+    if (!target) return;
+    if (dir === 'left') {
+      target.style.float = 'left';
+      target.style.margin = '12px 16px 12px 0';
+      target.style.display = 'inline-block';
+    } else if (dir === 'right') {
+      target.style.float = 'right';
+      target.style.margin = '12px 0 12px 16px';
+      target.style.display = 'inline-block';
+    } else {
+      target.style.float = 'none';
+      target.style.margin = '12px auto';
+      target.style.display = 'block';
+    }
+    target.setAttribute('data-moof-size', '1');
+    if (webEditorRef.current) {
+      onChangeNoteBody(webEditorRef.current.innerHTML ?? '');
+    }
   };
 
   const isClient = typeof window !== 'undefined';
@@ -3826,6 +3851,7 @@ function NotesView({
       const img = target?.closest('img');
       if (img && editor.contains(img)) {
         setSelectedImage(img as HTMLImageElement);
+        lastSelectedImageRef.current = img as HTMLImageElement;
       } else {
         setSelectedImage(null);
       }
@@ -4259,16 +4285,40 @@ function NotesView({
                         }}>
                         <Ionicons name="refresh-outline" size={16} color="#6b7280" />
                       </Pressable>
-                      <Pressable
-                        style={[styles.toolbarButton]}
-                        onPressIn={(e) => {
-                          e.preventDefault?.();
-                          adjustImageSize(40);
-                        }}>
-                        <Ionicons name="add-circle-outline" size={16} color="#6b7280" />
-                      </Pressable>
-                    </View>
-                  </ScrollView>
+                    <Pressable
+                      style={[styles.toolbarButton]}
+                      onPressIn={(e) => {
+                        e.preventDefault?.();
+                        adjustImageSize(40);
+                      }}>
+                      <Ionicons name="add-circle-outline" size={16} color="#6b7280" />
+                    </Pressable>
+                    <Pressable
+                      style={[styles.toolbarButton]}
+                      onPressIn={(e) => {
+                        e.preventDefault?.();
+                        setImageFloat('left');
+                      }}>
+                      <MaterialIcons name="format-align-left" size={18} color="#6b7280" />
+                    </Pressable>
+                    <Pressable
+                      style={[styles.toolbarButton]}
+                      onPressIn={(e) => {
+                        e.preventDefault?.();
+                        setImageFloat('none');
+                      }}>
+                      <MaterialIcons name="format-align-center" size={18} color="#6b7280" />
+                    </Pressable>
+                    <Pressable
+                      style={[styles.toolbarButton]}
+                      onPressIn={(e) => {
+                        e.preventDefault?.();
+                        setImageFloat('right');
+                      }}>
+                      <MaterialIcons name="format-align-right" size={18} color="#6b7280" />
+                    </Pressable>
+                  </View>
+                </ScrollView>
                 ) : (
                   <ScrollView
                     horizontal
