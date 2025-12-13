@@ -61,6 +61,8 @@ type NoteFolder = {
   icon?: string | null;
   notes_count?: number | null;
   created_at?: string;
+  parent_folder_id?: string | null;
+  is_expanded?: boolean;
 };
 
 type Note = {
@@ -344,6 +346,7 @@ function AppShell({ session, onSignOut }: AppShellProps) {
   const [folders, setFolders] = useState<NoteFolder[]>([]);
   const [sharedFolders, setSharedFolders] = useState<NoteFolder[]>([]);
   const [folderInput, setFolderInput] = useState('');
+  const [expandedFolders, setExpandedFolders] = useState<Set<string>>(new Set());
   const [notesLoading, setNotesLoading] = useState(false);
   const [notesError, setNotesError] = useState<string | null>(null);
   const [notes, setNotes] = useState<Note[]>([]);
@@ -372,6 +375,7 @@ function AppShell({ session, onSignOut }: AppShellProps) {
   const [folderOverlayName, setFolderOverlayName] = useState('');
   const [folderOverlayColor, setFolderOverlayColor] = useState<string | null>(null);
   const [folderOverlayIcon, setFolderOverlayIcon] = useState<string | null>('folder-outline');
+  const [folderOverlayParentId, setFolderOverlayParentId] = useState<string | null>(null);
   const [alertMessage, setAlertMessage] = useState<{
     title: string;
     message: string;
@@ -776,21 +780,72 @@ function AppShell({ session, onSignOut }: AppShellProps) {
     setNotesLoading(false);
   };
 
-  const addFolder = async (nameOverride?: string, iconOverride?: string | null, colorOverride?: string | null) => {
+  const addFolder = async (nameOverride?: string, iconOverride?: string | null, colorOverride?: string | null, parentFolderId?: string | null) => {
     const name = (nameOverride ?? folderInput).trim();
     if (!name) return;
+    console.log('🔧 addFolder called with parentFolderId:', parentFolderId);
     setNotesLoading(true);
     const payload = {
       name,
       user_id: session?.user?.id,
       color: colorOverride ?? null,
       icon: iconOverride ?? null,
+      parent_folder_id: parentFolderId ?? null,
     };
-    const { error } = await supabase.from('note_folders').insert(payload);
+    const { data: newFolder, error } = await supabase.from('note_folders').insert(payload).select().single();
+    console.log('🔧 newFolder created:', newFolder, 'error:', error);
     if (error) {
       setNotesError(error.message);
       setNotesLoading(false);
     } else {
+      // If this is a subfolder, automatically share it with ALL ancestor folder collaborators
+      console.log('🔧 Checking auto-share condition: parentFolderId=', parentFolderId, 'newFolder=', !!newFolder);
+      if (parentFolderId && newFolder) {
+        console.log('🔧 AUTO-SHARE TRIGGERED for folder');
+        // Function to get all ancestor folder IDs (parent, grandparent, etc.)
+        const getAllAncestorIds = async (folderId: string): Promise<string[]> => {
+          const { data: folder } = await supabase
+            .from('note_folders')
+            .select('parent_folder_id')
+            .eq('id', folderId)
+            .single();
+
+          if (!folder || !folder.parent_folder_id) {
+            return [folderId];
+          }
+
+          const ancestors = await getAllAncestorIds(folder.parent_folder_id);
+          return [folderId, ...ancestors];
+        };
+
+        // Get all ancestor folder IDs
+        const ancestorIds = await getAllAncestorIds(parentFolderId);
+        console.log(`📂 Checking ${ancestorIds.length} ancestor folders for collaborators:`, ancestorIds);
+
+        // Get all unique collaborators from ALL ancestor folders
+        const { data: allAncestorCollabs } = await supabase
+          .from('folder_collaborators')
+          .select('user_id, permission')
+          .in('folder_id', ancestorIds);
+
+        if (allAncestorCollabs && allAncestorCollabs.length > 0) {
+          // Remove duplicates (same user might have access via multiple ancestors)
+          const uniqueCollabs = Array.from(
+            new Map(allAncestorCollabs.map(c => [c.user_id, c])).values()
+          );
+
+          const folderCollaborators = uniqueCollabs.map(collab => ({
+            folder_id: newFolder.id,
+            user_id: collab.user_id,
+            permission: collab.permission,
+            invited_by: session?.user?.id,
+          }));
+
+          await supabase.from('folder_collaborators').insert(folderCollaborators);
+          console.log(`✅ Auto-shared new subfolder with ${uniqueCollabs.length} collaborators`);
+        }
+      }
+
       setFolderInput('');
       fetchFolders();
     }
@@ -824,21 +879,56 @@ function AppShell({ session, onSignOut }: AppShellProps) {
   const deleteFolder = async (folderId: string) => {
     setNotesLoading(true);
 
-    // First, check if there are notes in this folder
-    const { data: notesInFolder } = await supabase
+    // Recursive function to get all subfolder IDs
+    const getAllSubfolderIds = async (parentId: string): Promise<string[]> => {
+      const { data: subfolders } = await supabase
+        .from('note_folders')
+        .select('id')
+        .eq('parent_folder_id', parentId);
+
+      if (!subfolders || subfolders.length === 0) {
+        return [];
+      }
+
+      let allIds: string[] = subfolders.map(f => f.id);
+
+      // Recursively get sub-subfolders
+      for (const subfolder of subfolders) {
+        const subSubfolderIds = await getAllSubfolderIds(subfolder.id);
+        allIds = [...allIds, ...subSubfolderIds];
+      }
+
+      return allIds;
+    };
+
+    // Get all subfolder IDs recursively
+    const subfolderIds = await getAllSubfolderIds(folderId);
+    const allFolderIds = [folderId, ...subfolderIds];
+
+    // Check if there are notes in this folder or any subfolders
+    const { data: notesInFolders } = await supabase
       .from('notes')
       .select('id')
-      .eq('folder_id', folderId);
+      .in('folder_id', allFolderIds);
 
-    if (notesInFolder && notesInFolder.length > 0) {
-      // Move notes to "no folder" (set folder_id to null)
+    if (notesInFolders && notesInFolders.length > 0) {
+      // Move all notes to "no folder" (set folder_id to null)
       await supabase
         .from('notes')
         .update({ folder_id: null })
-        .eq('folder_id', folderId);
+        .in('folder_id', allFolderIds);
     }
 
-    // Delete the folder
+    // Delete all subfolders (cascade will happen via database ON DELETE CASCADE)
+    // But we'll delete them explicitly in reverse order (deepest first)
+    for (let i = subfolderIds.length - 1; i >= 0; i--) {
+      await supabase
+        .from('note_folders')
+        .delete()
+        .eq('id', subfolderIds[i]);
+    }
+
+    // Delete the main folder
     const { error } = await supabase
       .from('note_folders')
       .delete()
@@ -852,18 +942,37 @@ function AppShell({ session, onSignOut }: AppShellProps) {
       });
       setNotesLoading(false);
     } else {
+      const totalDeleted = 1 + subfolderIds.length;
+      const notesMovedCount = notesInFolders?.length || 0;
+
       setAlertMessage({
         title: 'Success',
-        message: 'Folder deleted successfully!',
+        message: `${totalDeleted} folder${totalDeleted !== 1 ? 's' : ''} deleted! ${notesMovedCount} note${notesMovedCount !== 1 ? 's' : ''} moved to "No Folder".`,
         type: 'success',
       });
-      // Reset selected folder if we deleted the active one
-      if (selectedFolderId === folderId) {
+      // Reset selected folder if we deleted the active one or any of its subfolders
+      if (allFolderIds.includes(selectedFolderId || '')) {
         setSelectedFolderId(null);
       }
       fetchFolders();
       fetchNotes();
     }
+  };
+
+  const toggleFolder = (folderId: string) => {
+    setExpandedFolders((prev) => {
+      const newSet = new Set(prev);
+      if (newSet.has(folderId)) {
+        newSet.delete(folderId);
+      } else {
+        newSet.add(folderId);
+      }
+      return newSet;
+    });
+  };
+
+  const addSubfolder = async (parentId: string, name: string, icon: string | null, color: string | null) => {
+    await addFolder(name, icon, color, parentId);
   };
 
   const shareFolderWithUser = async (folderId: string, userId: string, permission: 'view' | 'edit' = 'edit') => {
@@ -927,22 +1036,101 @@ function AppShell({ session, onSignOut }: AppShellProps) {
 
       console.log('✅ Folder collaborator added successfully');
 
-      // Get all notes in this folder
-      const { data: notesInFolder } = await supabase
+      // Recursive function to share all subfolders
+      const shareSubfoldersRecursively = async (parentFolderId: string) => {
+        // Get all direct subfolders
+        const { data: subfolders } = await supabase
+          .from('note_folders')
+          .select('id')
+          .eq('parent_folder_id', parentFolderId);
+
+        if (subfolders && subfolders.length > 0) {
+          // Share each subfolder
+          for (const subfolder of subfolders) {
+            // Check if subfolder is already shared with this user
+            const { data: existingSubfolderShare } = await supabase
+              .from('folder_collaborators')
+              .select('id')
+              .eq('folder_id', subfolder.id)
+              .eq('user_id', userId)
+              .maybeSingle();
+
+            if (!existingSubfolderShare) {
+              // Share the subfolder
+              await supabase.from('folder_collaborators').insert({
+                folder_id: subfolder.id,
+                user_id: userId,
+                permission,
+                invited_by: session.user.id,
+              });
+            }
+
+            // Recursively share sub-subfolders
+            await shareSubfoldersRecursively(subfolder.id);
+          }
+        }
+      };
+
+      // Share all subfolders recursively
+      await shareSubfoldersRecursively(folderId);
+
+      // Recursive function to get ALL subfolder IDs (not just direct children)
+      const getAllSubfolderIds = async (parentId: string): Promise<string[]> => {
+        const { data: subfolders } = await supabase
+          .from('note_folders')
+          .select('id')
+          .eq('parent_folder_id', parentId);
+
+        if (!subfolders || subfolders.length === 0) {
+          return [];
+        }
+
+        let allIds: string[] = subfolders.map(f => f.id);
+
+        // Recursively get sub-subfolders
+        for (const subfolder of subfolders) {
+          const subSubfolderIds = await getAllSubfolderIds(subfolder.id);
+          allIds = [...allIds, ...subSubfolderIds];
+        }
+
+        return allIds;
+      };
+
+      // Get ALL subfolder IDs recursively
+      const allSubfolderIds = await getAllSubfolderIds(folderId);
+      const folderIdsToShare = [folderId, ...allSubfolderIds];
+
+      console.log(`📁 Sharing notes in ${folderIdsToShare.length} folders:`, folderIdsToShare);
+
+      const { data: notesInFolders } = await supabase
         .from('notes')
         .select('id')
-        .eq('folder_id', folderId);
+        .in('folder_id', folderIdsToShare);
 
-      // Share all existing notes in the folder with this user
-      if (notesInFolder && notesInFolder.length > 0) {
-        const noteCollaborators = notesInFolder.map(note => ({
-          note_id: note.id,
-          user_id: userId,
-          permission,
-          invited_by: session.user.id,
-        }));
+      // Share all existing notes in the folder tree with this user
+      if (notesInFolders && notesInFolders.length > 0) {
+        // Check which notes are already shared
+        const { data: existingNoteShares } = await supabase
+          .from('note_collaborators')
+          .select('note_id')
+          .eq('user_id', userId)
+          .in('note_id', notesInFolders.map(n => n.id));
 
-        await supabase.from('note_collaborators').insert(noteCollaborators);
+        const alreadySharedNoteIds = new Set(existingNoteShares?.map(s => s.note_id) || []);
+
+        // Only share notes that aren't already shared
+        const notesToShare = notesInFolders.filter(note => !alreadySharedNoteIds.has(note.id));
+
+        if (notesToShare.length > 0) {
+          const noteCollaborators = notesToShare.map(note => ({
+            note_id: note.id,
+            user_id: userId,
+            permission,
+            invited_by: session.user.id,
+          }));
+
+          await supabase.from('note_collaborators').insert(noteCollaborators);
+        }
       }
 
       await fetchFolderCollaborators(folderId);
@@ -953,9 +1141,15 @@ function AppShell({ session, onSignOut }: AppShellProps) {
       setUserSearchQuery('');
       setSearchedUsers([]);
 
+      // Count total items shared
+      const subfoldersCount = allSubfolderIds.length;
+      const notesCount = notesInFolders?.length || 0;
+
+      console.log(`✅ Successfully shared: ${subfoldersCount} subfolders, ${notesCount} notes`);
+
       setAlertMessage({
         title: 'Success',
-        message: `Folder shared successfully! ${notesInFolder?.length || 0} notes also shared.`,
+        message: `Folder shared successfully! ${subfoldersCount} subfolder${subfoldersCount !== 1 ? 's' : ''} and ${notesCount} note${notesCount !== 1 ? 's' : ''} also shared.`,
         type: 'success',
       });
     } catch (e) {
@@ -1182,6 +1376,7 @@ function AppShell({ session, onSignOut }: AppShellProps) {
   const addNote = async () => {
     const targetFolder = selectedFolderId || null;
     if (!noteTitle.trim()) return;
+    console.log('🔧 addNote called with targetFolder:', targetFolder);
     setNotesListLoading(true);
     const payload = {
       title: noteTitle.trim(),
@@ -1192,18 +1387,47 @@ function AppShell({ session, onSignOut }: AppShellProps) {
       color: noteColor,
     };
     const { data: newNote, error } = await supabase.from('notes').insert(payload).select().single();
+    console.log('🔧 newNote created:', newNote, 'error:', error);
     if (error) {
       setNotesError(error.message);
     } else {
-      // If the note is in a shared folder, automatically add folder collaborators to the note
+      // If the note is in a folder, automatically share with ALL ancestor folder collaborators
+      console.log('🔧 Checking auto-share condition for note: targetFolder=', targetFolder, 'newNote=', !!newNote);
       if (targetFolder && newNote) {
-        const { data: folderCollabs } = await supabase
+        console.log('🔧 AUTO-SHARE TRIGGERED for note');
+        // Function to get all ancestor folder IDs recursively
+        const getAllAncestorIds = async (folderId: string): Promise<string[]> => {
+          const { data: folder } = await supabase
+            .from('note_folders')
+            .select('parent_folder_id')
+            .eq('id', folderId)
+            .single();
+
+          if (!folder || !folder.parent_folder_id) {
+            return [folderId];
+          }
+
+          const ancestors = await getAllAncestorIds(folder.parent_folder_id);
+          return [folderId, ...ancestors];
+        };
+
+        // Get all ancestor folder IDs (includes current folder)
+        const ancestorIds = await getAllAncestorIds(targetFolder);
+        console.log(`📝 Checking ${ancestorIds.length} ancestor folders for note sharing:`, ancestorIds);
+
+        // Get all unique collaborators from ALL ancestor folders
+        const { data: allAncestorCollabs } = await supabase
           .from('folder_collaborators')
           .select('user_id, permission')
-          .eq('folder_id', targetFolder);
+          .in('folder_id', ancestorIds);
 
-        if (folderCollabs && folderCollabs.length > 0) {
-          const noteCollaborators = folderCollabs.map(collab => ({
+        if (allAncestorCollabs && allAncestorCollabs.length > 0) {
+          // Remove duplicates (same user might have access via multiple ancestors)
+          const uniqueCollabs = Array.from(
+            new Map(allAncestorCollabs.map(c => [c.user_id, c])).values()
+          );
+
+          const noteCollaborators = uniqueCollabs.map(collab => ({
             note_id: newNote.id,
             user_id: collab.user_id,
             permission: collab.permission,
@@ -1211,7 +1435,7 @@ function AppShell({ session, onSignOut }: AppShellProps) {
           }));
 
           await supabase.from('note_collaborators').insert(noteCollaborators);
-          console.log(`✅ Auto-shared note with ${folderCollabs.length} folder collaborators`);
+          console.log(`✅ Auto-shared new note with ${uniqueCollabs.length} collaborators`);
         }
       }
 
@@ -1670,6 +1894,9 @@ function AppShell({ session, onSignOut }: AppShellProps) {
             showEditFolderOverlay={showEditFolderOverlay}
             setShowEditFolderOverlay={setShowEditFolderOverlay}
             currentUserId={session?.user?.id}
+            expandedFolders={expandedFolders}
+            onToggleFolder={toggleFolder}
+            onAddSubfolder={addSubfolder}
           />
         );
       default:
@@ -1809,15 +2036,16 @@ function AppShell({ session, onSignOut }: AppShellProps) {
               setFolderOverlayName('');
               setFolderOverlayColor(null);
               setFolderOverlayIcon('folder-outline');
+              setFolderOverlayParentId(null);
             }}
           />
           <Animated.View
             entering={isWeb ? undefined : ZoomIn.duration(250).springify()}
             exiting={isWeb ? undefined : ZoomOut.duration(180)}
             style={styles.overlayCard}>
-            <Text style={styles.overlayTitle}>Create Folder</Text>
+            <Text style={styles.overlayTitle}>{folderOverlayParentId ? 'Create Subfolder' : 'Create Folder'}</Text>
             <Text style={styles.overlaySubtitle}>
-              Organize your notes by creating a new folder
+              {folderOverlayParentId ? 'Add a subfolder to organize your notes' : 'Organize your notes by creating a new folder'}
             </Text>
 
             <View style={{ marginTop: 20 }}>
@@ -1951,6 +2179,7 @@ function AppShell({ session, onSignOut }: AppShellProps) {
                   setFolderOverlayName('');
                   setFolderOverlayColor(null);
                   setFolderOverlayIcon('folder-outline');
+                  setFolderOverlayParentId(null);
                 }}>
                 <Text style={styles.overlayCancelText}>Cancel</Text>
               </TouchableOpacity>
@@ -1961,11 +2190,12 @@ function AppShell({ session, onSignOut }: AppShellProps) {
                 ]}
                 disabled={!folderOverlayName.trim()}
                 onPress={async () => {
-                  await addFolder(folderOverlayName, folderOverlayIcon, folderOverlayColor);
+                  await addFolder(folderOverlayName, folderOverlayIcon, folderOverlayColor, folderOverlayParentId);
                   setShowFolderOverlay(false);
                   setFolderOverlayName('');
                   setFolderOverlayColor(null);
                   setFolderOverlayIcon('folder-outline');
+                  setFolderOverlayParentId(null);
                 }}>
                 <Ionicons
                   name="add-circle-outline"
@@ -2079,9 +2309,7 @@ function AppShell({ session, onSignOut }: AppShellProps) {
             exiting={isWeb ? undefined : ZoomOut.duration(180)}
             style={styles.overlayCard}>
             <Text style={styles.overlayTitle}>Edit Folder</Text>
-            <Text style={styles.overlaySubtitle}>
-              Update your folder details
-            </Text>
+            <Text style={styles.overlaySubtitle}>Update your folder details</Text>
 
             <View style={{ marginTop: 20 }}>
               <Text style={styles.overlayLabel}>Folder Name</Text>
@@ -2206,10 +2434,51 @@ function AppShell({ session, onSignOut }: AppShellProps) {
               </View>
             </View>
 
-            <View style={styles.overlayActions}>
-              <View style={{ flexDirection: 'row', gap: 8 }}>
+            {/* Extra Actions Row */}
+            <View style={{ marginTop: 20, flexDirection: 'row', gap: 8 }}>
+              <TouchableOpacity
+                style={{
+                  flex: 1,
+                  flexDirection: 'row',
+                  alignItems: 'center',
+                  justifyContent: 'center',
+                  gap: 6,
+                  paddingVertical: 10,
+                  paddingHorizontal: 12,
+                  backgroundColor: '#10b98110',
+                  borderRadius: 10,
+                  borderWidth: 1,
+                  borderColor: '#10b98130',
+                }}
+                onPress={() => {
+                  const parentId = editingFolder.id;
+                  const parentColor = editingFolder.color;
+                  const parentIcon = editingFolder.icon;
+                  setShowEditFolderOverlay(false);
+                  setEditingFolder(null);
+                  setFolderOverlayName('');
+                  setFolderOverlayColor(parentColor || null);
+                  setFolderOverlayIcon(parentIcon || null);
+                  setFolderOverlayParentId(parentId);
+                  setShowFolderOverlay(true);
+                }}>
+                <Ionicons name="add-circle-outline" size={16} color="#10b981" />
+                <Text style={{ fontSize: 13, fontWeight: '600', color: '#10b981' }}>Subfolder</Text>
+              </TouchableOpacity>
+              {/* Only show Share button if this folder is a top-level folder (no parent) */}
+              {!editingFolder.parent_folder_id && (
                 <TouchableOpacity
-                  style={styles.shareFolderButton}
+                  style={{
+                    flexDirection: 'row',
+                    alignItems: 'center',
+                    justifyContent: 'center',
+                    paddingVertical: 10,
+                    paddingHorizontal: 14,
+                    backgroundColor: '#3b82f610',
+                    borderRadius: 10,
+                    borderWidth: 1,
+                    borderColor: '#3b82f630',
+                  }}
                   onPress={() => {
                     setSharingFolder(editingFolder);
                     setShowShareFolderModal(true);
@@ -2217,58 +2486,67 @@ function AppShell({ session, onSignOut }: AppShellProps) {
                     fetchFolderCollaborators(editingFolder.id);
                   }}>
                   <Ionicons name="people-outline" size={18} color="#3b82f6" />
-                  <Text style={styles.shareFolderButtonText}>Share</Text>
                 </TouchableOpacity>
-                <TouchableOpacity
-                  style={styles.deleteFolderButton}
-                  onPress={() => {
-                    setFolderToDelete(editingFolder);
-                    setDeleteFolderConfirmOpen(true);
-                    setShowEditFolderOverlay(false);
-                  }}>
-                  <Ionicons name="trash-outline" size={18} color="#ef4444" />
-                  <Text style={styles.deleteFolderButtonText}>Delete</Text>
-                </TouchableOpacity>
-              </View>
-              <View style={{ flexDirection: 'row', gap: 12, flex: 1 }}>
-                <TouchableOpacity
-                  style={styles.overlayCancelButton}
-                  onPress={() => {
-                    setShowEditFolderOverlay(false);
-                    setEditingFolder(null);
-                  }}>
-                  <Text style={styles.overlayCancelText}>Cancel</Text>
-                </TouchableOpacity>
-                <TouchableOpacity
+              )}
+              <TouchableOpacity
+                style={{
+                  flexDirection: 'row',
+                  alignItems: 'center',
+                  justifyContent: 'center',
+                  paddingVertical: 10,
+                  paddingHorizontal: 14,
+                  backgroundColor: '#ef444410',
+                  borderRadius: 10,
+                  borderWidth: 1,
+                  borderColor: '#ef444430',
+                }}
+                onPress={() => {
+                  setFolderToDelete(editingFolder);
+                  setDeleteFolderConfirmOpen(true);
+                  setShowEditFolderOverlay(false);
+                }}>
+                <Ionicons name="trash-outline" size={18} color="#ef4444" />
+              </TouchableOpacity>
+            </View>
+
+            <View style={styles.overlayActions}>
+              <TouchableOpacity
+                style={styles.overlayCancelButton}
+                onPress={() => {
+                  setShowEditFolderOverlay(false);
+                  setEditingFolder(null);
+                }}>
+                <Text style={styles.overlayCancelText}>Cancel</Text>
+              </TouchableOpacity>
+              <TouchableOpacity
+                style={[
+                  styles.overlayCreateButton,
+                  !editingFolder.name.trim() && styles.overlayCreateButtonDisabled,
+                ]}
+                disabled={!editingFolder.name.trim()}
+                onPress={async () => {
+                  await updateFolder(
+                    editingFolder.id,
+                    editingFolder.name,
+                    editingFolder.icon || null,
+                    editingFolder.color || null
+                  );
+                  setShowEditFolderOverlay(false);
+                  setEditingFolder(null);
+                }}>
+                <Ionicons
+                  name="checkmark-circle-outline"
+                  size={18}
+                  color={!editingFolder.name.trim() ? '#9ca3af' : '#fff'}
+                />
+                <Text
                   style={[
-                    styles.overlayCreateButton,
-                    !editingFolder.name.trim() && styles.overlayCreateButtonDisabled,
-                  ]}
-                  disabled={!editingFolder.name.trim()}
-                  onPress={async () => {
-                    await updateFolder(
-                      editingFolder.id,
-                      editingFolder.name,
-                      editingFolder.icon || null,
-                      editingFolder.color || null
-                    );
-                    setShowEditFolderOverlay(false);
-                    setEditingFolder(null);
-                  }}>
-                  <Ionicons
-                    name="checkmark-circle-outline"
-                    size={18}
-                    color={!editingFolder.name.trim() ? '#9ca3af' : '#fff'}
-                  />
-                  <Text
-                    style={[
-                      styles.overlayCreateText,
-                      !editingFolder.name.trim() && styles.overlayCreateTextDisabled,
-                    ]}>
-                    Save
-                  </Text>
-                </TouchableOpacity>
-              </View>
+                    styles.overlayCreateText,
+                    !editingFolder.name.trim() && styles.overlayCreateTextDisabled,
+                  ]}>
+                  Save
+                </Text>
+              </TouchableOpacity>
             </View>
           </Animated.View>
         </Animated.View>
@@ -3093,6 +3371,9 @@ type NotesViewProps = {
   showEditFolderOverlay: boolean;
   setShowEditFolderOverlay: (show: boolean) => void;
   currentUserId: string | undefined;
+  expandedFolders: Set<string>;
+  onToggleFolder: (folderId: string) => void;
+  onAddSubfolder: (parentId: string, name: string, icon: string | null, color: string | null) => void;
 };
 
 function NotesView({
@@ -3143,11 +3424,41 @@ function NotesView({
   showEditFolderOverlay,
   setShowEditFolderOverlay,
   currentUserId,
+  expandedFolders,
+  onToggleFolder,
+  onAddSubfolder,
 }: NotesViewProps) {
   // Calculate totals based on actual notes, not folder counts (which may be stale)
   const totalNotes = notes.length + sharedNotes.length;
   const looseNotes = notes.filter((n) => !n.folder_id);
   const looseSharedNotes = sharedNotes.filter((n) => !n.folder_id);
+
+  // Helper function to get subfolders of a parent
+  const getSubfolders = (parentId: string | null, folderList: NoteFolder[]) => {
+    return folderList.filter((f) => f.parent_folder_id === parentId);
+  };
+
+  // Helper function to get all descendant folder IDs (including the folder itself)
+  const getAllDescendantFolderIds = (folderId: string, folderList: NoteFolder[]): string[] => {
+    const descendants = [folderId];
+    const subfolders = getSubfolders(folderId, folderList);
+
+    for (const subfolder of subfolders) {
+      descendants.push(...getAllDescendantFolderIds(subfolder.id, folderList));
+    }
+
+    return descendants;
+  };
+
+  // Helper function to count notes in a folder including all subfolders
+  const countNotesInFolderTree = (folderId: string, folderList: NoteFolder[], noteList: Note[]) => {
+    const allFolderIds = getAllDescendantFolderIds(folderId, folderList);
+    return noteList.filter((n) => allFolderIds.includes(n.folder_id)).length;
+  };
+
+  // Get only top-level folders (no parent)
+  const topLevelFolders = folders.filter((f) => !f.parent_folder_id);
+  const topLevelSharedFolders = sharedFolders.filter((f) => !f.parent_folder_id);
 
   console.log('🔍 NotesView render:', {
     notesCount: notes.length,
@@ -3592,102 +3903,206 @@ function NotesView({
 
   // Dedicated editor screen (no overlay)
   if (noteModalOpen) {
+    // Calculate word and character count
+    const plainText = noteBody.replace(/<[^>]*>/g, '').trim();
+    const wordCount = plainText ? plainText.split(/\s+/).length : 0;
+    const charCount = plainText.length;
+
     return (
-      <View style={{ flex: 1, backgroundColor: '#f3f4f6', padding: 16, position: 'relative' }}>
-        <View style={{ flexDirection: 'row', justifyContent: 'space-between', alignItems: 'center', marginBottom: 10 }}>
-          <View style={{ flexDirection: 'row', alignItems: 'center', gap: 12 }}>
-            <Text style={styles.heroTitle}>{editingNote ? 'Edit Note' : 'New Note'}</Text>
-            {/* Auto-save indicator */}
-            {editingNote && autoSaveStatus !== 'idle' && (
-              <View style={{ flexDirection: 'row', alignItems: 'center', gap: 6 }}>
-                {autoSaveStatus === 'saving' && (
-                  <>
-                    <View style={{ width: 6, height: 6, borderRadius: 3, backgroundColor: '#f59e0b' }} />
-                    <Text style={{ fontSize: 12, color: '#f59e0b', fontWeight: '500' }}>Saving...</Text>
-                  </>
-                )}
-                {autoSaveStatus === 'saved' && (
-                  <>
-                    <Ionicons name="checkmark-circle" size={14} color="#10b981" />
-                    <Text style={{ fontSize: 12, color: '#10b981', fontWeight: '500' }}>Saved</Text>
-                  </>
-                )}
+      <View style={{ flex: 1, backgroundColor: '#fafafa', position: 'relative' }}>
+        {/* Modern Header */}
+        <View style={{
+          backgroundColor: '#fff',
+          borderBottomWidth: 1,
+          borderBottomColor: '#e5e7eb',
+          paddingHorizontal: 20,
+          paddingVertical: 16,
+          shadowColor: '#000',
+          shadowOffset: { width: 0, height: 1 },
+          shadowOpacity: 0.05,
+          shadowRadius: 3,
+          elevation: 2,
+        }}>
+          <View style={{ flexDirection: 'row', justifyContent: 'space-between', alignItems: 'center' }}>
+            {/* Left side - Title and status */}
+            <View style={{ flexDirection: 'row', alignItems: 'center', gap: 16, flex: 1 }}>
+              <TouchableOpacity
+                onPress={onCloseNoteModal}
+                style={{
+                  width: 36,
+                  height: 36,
+                  borderRadius: 18,
+                  backgroundColor: '#f3f4f6',
+                  alignItems: 'center',
+                  justifyContent: 'center',
+                }}>
+                <Ionicons name="arrow-back" size={20} color="#1f2937" />
+              </TouchableOpacity>
+              <View style={{ flex: 1 }}>
+                <Text style={{ fontSize: 18, fontWeight: '700', color: '#1f2937' }}>
+                  {editingNote ? 'Edit Note' : 'New Note'}
+                </Text>
+                <View style={{ flexDirection: 'row', alignItems: 'center', gap: 12, marginTop: 4 }}>
+                  {/* Word/Char count */}
+                  <Text style={{ fontSize: 12, color: '#6b7280' }}>
+                    {wordCount} {wordCount === 1 ? 'word' : 'words'} · {charCount} {charCount === 1 ? 'char' : 'chars'}
+                  </Text>
+                  {/* Auto-save indicator */}
+                  {editingNote && autoSaveStatus !== 'idle' && (
+                    <>
+                      <View style={{ width: 3, height: 3, borderRadius: 1.5, backgroundColor: '#d1d5db' }} />
+                      <View style={{ flexDirection: 'row', alignItems: 'center', gap: 4 }}>
+                        {autoSaveStatus === 'saving' && (
+                          <>
+                            <View style={{ width: 6, height: 6, borderRadius: 3, backgroundColor: '#f59e0b' }} />
+                            <Text style={{ fontSize: 11, color: '#f59e0b', fontWeight: '600' }}>Saving</Text>
+                          </>
+                        )}
+                        {autoSaveStatus === 'saved' && (
+                          <>
+                            <Ionicons name="checkmark-circle" size={13} color="#10b981" />
+                            <Text style={{ fontSize: 11, color: '#10b981', fontWeight: '600' }}>Saved</Text>
+                          </>
+                        )}
+                      </View>
+                    </>
+                  )}
+                </View>
               </View>
-            )}
-          </View>
-          <View style={{ flexDirection: 'row', gap: 8, alignItems: 'center' }}>
-            {/* Share and Export buttons - only show when editing existing note */}
-            {editingNote && (
-              <>
-                <TouchableOpacity
-                  style={[styles.iconButton, { backgroundColor: '#f1f5f9', borderColor: '#cbd5e1' }]}
-                  onPress={() => {
-                    if (editingNote) {
-                      onShareNote(editingNote);
-                    }
-                  }}>
-                  <Ionicons name="share-social-outline" size={20} color="#475569" />
-                </TouchableOpacity>
-                <TouchableOpacity
-                  style={[styles.iconButton, { backgroundColor: '#fef3c7', borderColor: '#fde047' }]}
-                  onPress={() => {
-                    if (Platform.OS === 'web') {
-                      // Create print container with content
-                      const printContainer = document.createElement('div');
-                      printContainer.id = 'print-note-container';
-                      printContainer.className = 'print-note-container';
-                      printContainer.innerHTML = `
-                        <h1 class="print-note-title">
-                          ${noteTitle || 'Untitled Note'}
-                        </h1>
-                        <div class="print-note-content">
-                          ${noteBody || '<p style="color: #94a3b8; font-style: italic;">No content</p>'}
-                        </div>
-                      `;
+            </View>
 
-                      // Add to body
-                      document.body.appendChild(printContainer);
-
-                      // Print
-                      window.print();
-
-                      // Remove after print
-                      setTimeout(() => {
-                        document.body.removeChild(printContainer);
-                      }, 1000);
-                    }
-                  }}>
-                  <Ionicons name="document-text-outline" size={20} color="#a16207" />
-                </TouchableOpacity>
-              </>
-            )}
-            <TouchableOpacity style={[styles.ghostButton, { paddingHorizontal: 14, height: 44 }]} onPress={onCloseNoteModal}>
-              <Text style={styles.ghostButtonText}>Cancel</Text>
-            </TouchableOpacity>
-            <TouchableOpacity
-              disabled={!noteTitle.trim() || notesLoading}
-              style={[styles.primaryButton, { paddingHorizontal: 20, height: 44 }]}
-              onPress={onCreateNote}>
-              <Text style={styles.primaryButtonText}>{editingNote ? 'Back' : 'Create'}</Text>
-            </TouchableOpacity>
+            {/* Right side - Actions */}
+            <View style={{ flexDirection: 'row', gap: 8, alignItems: 'center' }}>
+              {/* Share button */}
+              {editingNote && (
+                <>
+                  <TouchableOpacity
+                    style={{
+                      paddingVertical: 8,
+                      paddingHorizontal: 12,
+                      borderRadius: 10,
+                      backgroundColor: '#eff6ff',
+                      borderWidth: 1,
+                      borderColor: '#bfdbfe',
+                      flexDirection: 'row',
+                      alignItems: 'center',
+                      gap: 6,
+                    }}
+                    onPress={() => {
+                      if (editingNote) {
+                        onShareNote(editingNote);
+                      }
+                    }}>
+                    <Ionicons name="share-social-outline" size={16} color="#3b82f6" />
+                    <Text style={{ fontSize: 13, fontWeight: '600', color: '#3b82f6' }}>Share</Text>
+                  </TouchableOpacity>
+                  {/* Export/Print button */}
+                  <TouchableOpacity
+                    style={{
+                      width: 36,
+                      height: 36,
+                      borderRadius: 10,
+                      backgroundColor: '#fef3c7',
+                      borderWidth: 1,
+                      borderColor: '#fde047',
+                      alignItems: 'center',
+                      justifyContent: 'center',
+                    }}
+                    onPress={() => {
+                      if (Platform.OS === 'web') {
+                        const printContainer = document.createElement('div');
+                        printContainer.id = 'print-note-container';
+                        printContainer.className = 'print-note-container';
+                        printContainer.innerHTML = `
+                          <h1 class="print-note-title">
+                            ${noteTitle || 'Untitled Note'}
+                          </h1>
+                          <div class="print-note-content">
+                            ${noteBody || '<p style="color: #94a3b8; font-style: italic;">No content</p>'}
+                          </div>
+                        `;
+                        document.body.appendChild(printContainer);
+                        window.print();
+                        setTimeout(() => {
+                          document.body.removeChild(printContainer);
+                        }, 1000);
+                      }
+                    }}>
+                    <Ionicons name="print-outline" size={18} color="#ca8a04" />
+                  </TouchableOpacity>
+                </>
+              )}
+              {/* Save/Create button */}
+              <TouchableOpacity
+                disabled={!noteTitle.trim() || notesLoading}
+                style={{
+                  paddingVertical: 8,
+                  paddingHorizontal: 16,
+                  borderRadius: 10,
+                  backgroundColor: !noteTitle.trim() || notesLoading ? '#d1d5db' : ACCENT,
+                  flexDirection: 'row',
+                  alignItems: 'center',
+                  gap: 6,
+                }}
+                onPress={onCreateNote}>
+                <Ionicons name={editingNote ? "checkmark-circle" : "add-circle"} size={18} color="#fff" />
+                <Text style={{ fontSize: 14, fontWeight: '700', color: '#fff' }}>
+                  {editingNote ? 'Done' : 'Create'}
+                </Text>
+              </TouchableOpacity>
+            </View>
           </View>
         </View>
 
-        <ScrollView contentContainerStyle={{ paddingBottom: 40 }}>
-          <View style={{ gap: 12 }}>
-            <Text style={styles.inputLabel}>Title</Text>
+        <ScrollView contentContainerStyle={{ padding: 20, paddingBottom: 60 }}>
+          {/* Title Card */}
+          <View style={{
+            backgroundColor: '#fff',
+            borderRadius: 16,
+            padding: 20,
+            marginBottom: 16,
+            borderWidth: 1,
+            borderColor: '#e5e7eb',
+            shadowColor: '#000',
+            shadowOffset: { width: 0, height: 1 },
+            shadowOpacity: 0.03,
+            shadowRadius: 2,
+            elevation: 1,
+          }}>
+            <Text style={{ fontSize: 13, fontWeight: '600', color: '#6b7280', marginBottom: 12 }}>TITLE</Text>
             <TextInput
-              placeholder="Document title..."
+              placeholder="Untitled Note"
               value={noteTitle}
               onChangeText={onChangeNoteTitle}
-              style={[styles.textInput, styles.overlayInput, { fontSize: 24, fontWeight: '800', backgroundColor: '#fff' }]}
-              placeholderTextColor="#9ca3af"
+              style={{
+                fontSize: 28,
+                fontWeight: '800',
+                color: '#1f2937',
+                padding: 0,
+                margin: 0,
+                borderWidth: 0,
+                outlineWidth: 0,
+              }}
+              placeholderTextColor="#d1d5db"
               autoFocus
             />
           </View>
 
-          <View style={{ marginTop: 14, marginBottom: 10 }}>
-            <Text style={styles.inputLabel}>Toolbar</Text>
+          {/* Toolbar Card */}
+          <View style={{
+            backgroundColor: '#fff',
+            borderRadius: 16,
+            padding: 16,
+            marginBottom: 16,
+            borderWidth: 1,
+            borderColor: '#e5e7eb',
+            shadowColor: '#000',
+            shadowOffset: { width: 0, height: 1 },
+            shadowOpacity: 0.03,
+            shadowRadius: 2,
+            elevation: 1,
+          }}>
+            <Text style={{ fontSize: 13, fontWeight: '600', color: '#6b7280', marginBottom: 12 }}>FORMATTING</Text>
             {isWeb ? (
               <View style={{ position: 'relative', overflow: 'visible', zIndex: 9998 }}>
                 <ScrollView
@@ -3695,13 +4110,15 @@ function NotesView({
                   showsHorizontalScrollIndicator={false}
                   style={{ overflow: 'visible' }}
                   contentContainerStyle={{ gap: 8, paddingVertical: 8 }}>
+                  {/* Text Formatting */}
                   <Pressable
                     style={[styles.toolbarButton, webStates.bold && { backgroundColor: '#e5e7ff', borderColor: ACCENT }]}
                     onPressIn={(e) => {
                       e.preventDefault?.();
                       toggleInlineCommand('bold');
                     }}>
-                    <Text style={styles.toolbarButtonText}>B</Text>
+                    <Ionicons name="text" size={16} color={webStates.bold ? ACCENT : '#6b7280'} style={{ fontWeight: '900' }} />
+                    <Text style={[styles.toolbarButtonText, { fontWeight: '900' }]}>B</Text>
                   </Pressable>
                   <Pressable
                     style={[styles.toolbarButton, webStates.italic && { backgroundColor: '#e5e7ff', borderColor: ACCENT }]}
@@ -3709,7 +4126,7 @@ function NotesView({
                       e.preventDefault?.();
                       toggleInlineCommand('italic');
                     }}>
-                    <Text style={[styles.toolbarButtonText, { fontStyle: 'italic' }]}>i</Text>
+                    <Text style={[styles.toolbarButtonText, { fontStyle: 'italic', fontWeight: '600' }]}>I</Text>
                   </Pressable>
                   <Pressable
                     style={[styles.toolbarButton, webStates.underline && { backgroundColor: '#e5e7ff', borderColor: ACCENT }]}
@@ -3719,14 +4136,91 @@ function NotesView({
                     }}>
                     <Text style={[styles.toolbarButtonText, { textDecorationLine: 'underline' }]}>U</Text>
                   </Pressable>
+
+                  {/* Divider */}
+                  <View style={{ width: 1, height: 24, backgroundColor: '#e5e7eb', marginHorizontal: 4 }} />
+
+                  {/* Headings */}
+                  <Pressable
+                    style={[styles.toolbarButton, webStates.h1 && { backgroundColor: '#e5e7ff', borderColor: ACCENT }]}
+                    onPressIn={(e) => {
+                      e.preventDefault?.();
+                      const nextBlock = webStates.h1 ? 'p' : 'h1';
+                      runWebCommand('formatBlock', nextBlock);
+                    }}>
+                    <Text style={[styles.toolbarButtonText, { fontSize: 15, fontWeight: '700' }]}>H1</Text>
+                  </Pressable>
+                  <Pressable
+                    style={[styles.toolbarButton, webStates.h2 && { backgroundColor: '#e5e7ff', borderColor: ACCENT }]}
+                    onPressIn={(e) => {
+                      e.preventDefault?.();
+                      const nextBlock = webStates.h2 ? 'p' : 'h2';
+                      runWebCommand('formatBlock', nextBlock);
+                    }}>
+                    <Text style={[styles.toolbarButtonText, { fontSize: 14, fontWeight: '700' }]}>H2</Text>
+                  </Pressable>
+                  <Pressable
+                    style={[styles.toolbarButton, webStates.h3 && { backgroundColor: '#e5e7ff', borderColor: ACCENT }]}
+                    onPressIn={(e) => {
+                      e.preventDefault?.();
+                      const nextBlock = webStates.h3 ? 'p' : 'h3';
+                      runWebCommand('formatBlock', nextBlock);
+                    }}>
+                    <Text style={[styles.toolbarButtonText, { fontSize: 13, fontWeight: '700' }]}>H3</Text>
+                  </Pressable>
+
+                  {/* Divider */}
+                  <View style={{ width: 1, height: 24, backgroundColor: '#e5e7eb', marginHorizontal: 4 }} />
+
+                  {/* Lists */}
                   <Pressable
                     style={[styles.toolbarButton, webStates.list && { backgroundColor: '#e5e7ff', borderColor: ACCENT }]}
                     onPressIn={(e) => {
                       e.preventDefault?.();
                       runWebCommand('insertUnorderedList');
                     }}>
-                    <Text style={styles.toolbarButtonText}>• List</Text>
+                    <Ionicons name="list" size={16} color={webStates.list ? ACCENT : '#6b7280'} />
                   </Pressable>
+                  <Pressable
+                    style={[styles.toolbarButton]}
+                    onPressIn={(e) => {
+                      e.preventDefault?.();
+                      runWebCommand('insertOrderedList');
+                    }}>
+                    <Ionicons name="list-outline" size={16} color="#6b7280" />
+                  </Pressable>
+
+                  {/* Divider */}
+                  <View style={{ width: 1, height: 24, backgroundColor: '#e5e7eb', marginHorizontal: 4 }} />
+
+                  {/* Alignment */}
+                  <Pressable
+                    style={[styles.toolbarButton]}
+                    onPressIn={(e) => {
+                      e.preventDefault?.();
+                      runWebCommand('justifyLeft');
+                    }}>
+                    <Ionicons name="align-horizontal-left" size={16} color="#6b7280" />
+                  </Pressable>
+                  <Pressable
+                    style={[styles.toolbarButton]}
+                    onPressIn={(e) => {
+                      e.preventDefault?.();
+                      runWebCommand('justifyCenter');
+                    }}>
+                    <Ionicons name="align-horizontal-center" size={16} color="#6b7280" />
+                  </Pressable>
+                  <Pressable
+                    style={[styles.toolbarButton]}
+                    onPressIn={(e) => {
+                      e.preventDefault?.();
+                      runWebCommand('justifyRight');
+                    }}>
+                    <Ionicons name="align-horizontal-right" size={16} color="#6b7280" />
+                  </Pressable>
+
+                  {/* Divider */}
+                  <View style={{ width: 1, height: 24, backgroundColor: '#e5e7eb', marginHorizontal: 4 }} />
 
                   {/* Highlight button with color picker */}
                   <View style={{ flexDirection: 'row', alignItems: 'center', gap: 6 }}>
@@ -3739,13 +4233,13 @@ function NotesView({
                         e.preventDefault?.();
                         toggleHighlight();
                       }}>
-                      <Text style={styles.toolbarButtonText}>Highlight</Text>
+                      <Ionicons name="color-fill" size={16} color={webStates.highlight ? '#f59e0b' : '#6b7280'} />
                     </Pressable>
                     <Pressable
                       style={{
                         width: 24,
                         height: 24,
-                        borderRadius: 12,
+                        borderRadius: 6,
                         backgroundColor: highlightColor,
                         borderWidth: 2,
                         borderColor: '#d1d5db',
@@ -3754,23 +4248,40 @@ function NotesView({
                     />
                   </View>
 
+                  {/* Divider */}
+                  <View style={{ width: 1, height: 24, backgroundColor: '#e5e7eb', marginHorizontal: 4 }} />
+
+                  {/* Link */}
                   <Pressable
-                    style={[styles.toolbarButton, webStates.h1 && { backgroundColor: '#e5e7ff', borderColor: ACCENT }]}
+                    style={[styles.toolbarButton]}
                     onPressIn={(e) => {
                       e.preventDefault?.();
-                      const nextBlock = webStates.h1 ? 'p' : 'h1';
-                      runWebCommand('formatBlock', nextBlock);
+                      const url = prompt('Enter URL:');
+                      if (url) {
+                        runWebCommand('createLink', url);
+                      }
                     }}>
-                    <Text style={styles.toolbarButtonText}>H1</Text>
+                    <Ionicons name="link" size={16} color="#6b7280" />
                   </Pressable>
+
+                  {/* Code */}
                   <Pressable
-                    style={[styles.toolbarButton, webStates.h2 && { backgroundColor: '#e5e7ff', borderColor: ACCENT }]}
+                    style={[styles.toolbarButton]}
                     onPressIn={(e) => {
                       e.preventDefault?.();
-                      const nextBlock = webStates.h2 ? 'p' : 'h2';
-                      runWebCommand('formatBlock', nextBlock);
+                      runWebCommand('formatBlock', 'pre');
                     }}>
-                    <Text style={styles.toolbarButtonText}>H2</Text>
+                    <Ionicons name="code-slash" size={16} color="#6b7280" />
+                  </Pressable>
+
+                  {/* Quote */}
+                  <Pressable
+                    style={[styles.toolbarButton]}
+                    onPressIn={(e) => {
+                      e.preventDefault?.();
+                      runWebCommand('formatBlock', 'blockquote');
+                    }}>
+                    <Ionicons name="quote" size={16} color="#6b7280" />
                   </Pressable>
                 </ScrollView>
               </View>
@@ -3810,7 +4321,21 @@ function NotesView({
             )}
           </View>
 
-          <View style={{ gap: 0, backgroundColor: 'transparent', paddingVertical: 0, paddingHorizontal: 0, borderRadius: 0 }}>
+          {/* Content Editor Card */}
+          <View style={{
+            backgroundColor: '#fff',
+            borderRadius: 16,
+            padding: 24,
+            borderWidth: 1,
+            borderColor: '#e5e7eb',
+            shadowColor: '#000',
+            shadowOffset: { width: 0, height: 1 },
+            shadowOpacity: 0.03,
+            shadowRadius: 2,
+            elevation: 1,
+            minHeight: 500,
+          }}>
+            <Text style={{ fontSize: 13, fontWeight: '600', color: '#6b7280', marginBottom: 16 }}>CONTENT</Text>
             {isWeb ? (
               <div
                 ref={webEditorRef}
@@ -3847,24 +4372,19 @@ function NotesView({
                     onChangeNoteBody(html);
                   }}
                   style={{
-                    minHeight: 760,
-                    padding: '28px',
+                    minHeight: 400,
+                    padding: 0,
                     width: '100%',
-                    maxWidth: 720,
-                    margin: '0 auto',
-                    backgroundColor: '#fff',
-                    borderRadius: 14,
                     outline: 'none',
                     fontSize: 16,
-                    lineHeight: 1.7,
-                    fontFamily: 'Arial, sans-serif',
-                    color: '#0f172a',
+                    lineHeight: 1.8,
+                    fontFamily: 'system-ui, -apple-system, sans-serif',
+                    color: '#1f2937',
                     cursor: 'text',
                     whiteSpace: 'pre-wrap',
                     wordBreak: 'break-word',
                     textAlign: 'left',
-                  display: 'block',
-                  boxShadow: '0 8px 20px rgba(15,23,42,0.08)',
+                    display: 'block',
                 }}
               />
             ) : (
@@ -4136,8 +4656,9 @@ function NotesView({
                 </Text>
               </View>
             </Pressable>
-            {folders.map((folder) => {
+            {topLevelFolders.map((folder) => {
               const isActive = selectedFolderId === folder.id;
+              const noteCount = countNotesInFolderTree(folder.id, folders, notes);
               return (
                 <Pressable
                   key={folder.id}
@@ -4154,7 +4675,7 @@ function NotesView({
                   </Text>
                   <View style={[styles.filterChipBadge, isActive && styles.filterChipBadgeActive]}>
                     <Text style={[styles.filterChipBadgeText, isActive && styles.filterChipBadgeTextActive]}>
-                      {notes.filter((n) => n.folder_id === folder.id).length}
+                      {noteCount}
                     </Text>
                   </View>
                 </Pressable>
@@ -4184,14 +4705,42 @@ function NotesView({
                   </View>
                 </View>
               </View>
+
+              {/* Breadcrumb - Show selected subfolder location */}
+              {selectedFolderId && selectedFolderId !== 'shared' && !topLevelFolders.some(f => f.id === selectedFolderId) && !topLevelSharedFolders.some(f => f.id === selectedFolderId) && (() => {
+                const selectedSubfolder = [...folders, ...sharedFolders].find(f => f.id === selectedFolderId);
+                if (!selectedSubfolder || !selectedSubfolder.parent_folder_id) return null;
+
+                const parentFolder = [...folders, ...sharedFolders].find(f => f.id === selectedSubfolder.parent_folder_id);
+                if (!parentFolder) return null;
+
+                return (
+                  <View style={{ marginBottom: 12, flexDirection: 'row', alignItems: 'center', gap: 6, flexWrap: 'wrap' }}>
+                    <Pressable
+                      onPress={() => onSelectFolder(parentFolder.id)}
+                      style={{ flexDirection: 'row', alignItems: 'center', gap: 4, paddingVertical: 6, paddingHorizontal: 10, backgroundColor: '#f1f5f9', borderRadius: 8 }}>
+                      <Ionicons name="folder" size={14} color={parentFolder.color || '#64748b'} />
+                      <Text style={{ fontSize: 13, color: '#64748b', fontWeight: '500' }}>{parentFolder.name}</Text>
+                    </Pressable>
+                    <Ionicons name="chevron-forward" size={14} color="#94a3b8" />
+                    <View style={{ flexDirection: 'row', alignItems: 'center', gap: 4, paddingVertical: 6, paddingHorizontal: 10, backgroundColor: (selectedSubfolder.color || ACCENT) + '15', borderRadius: 8 }}>
+                      <Ionicons name="folder-open" size={14} color={selectedSubfolder.color || ACCENT} />
+                      <Text style={{ fontSize: 13, color: selectedSubfolder.color || ACCENT, fontWeight: '600' }}>{selectedSubfolder.name}</Text>
+                    </View>
+                  </View>
+                );
+              })()}
+
+              {/* Main Folders Grid */}
               <View style={styles.ultraFoldersGrid}>
-                {folders.map((folder, index) => {
-                  const folderNoteCount = [...notes, ...sharedNotes].filter((n) => n.folder_id === folder.id).length;
+                {topLevelFolders.map((folder, index) => {
+                  const folderNoteCount = countNotesInFolderTree(folder.id, folders, [...notes, ...sharedNotes]);
+
                   return (
                     <Animated.View
+                      key={folder.id}
                       entering={isWeb ? undefined : FadeInDown.duration(280).delay(150 + index * 50)}
-                      layout={isWeb ? undefined : Layout.springify()}
-                      key={folder.id}>
+                      layout={isWeb ? undefined : Layout.springify()}>
                       <Pressable
                         onPress={() => onSelectFolder(folder.id)}
                         style={({ pressed }) => [
@@ -4255,13 +4804,13 @@ function NotesView({
                 })}
 
                 {/* Shared Folders */}
-                {sharedFolders.map((folder, index) => {
-                  const folderNoteCount = [...notes, ...sharedNotes].filter((n) => n.folder_id === folder.id).length;
+                {topLevelSharedFolders.map((folder, index) => {
+                  const folderNoteCount = countNotesInFolderTree(folder.id, [...folders, ...sharedFolders], [...notes, ...sharedNotes]);
+
                   return (
                     <Animated.View
-                      entering={isWeb ? undefined : FadeInDown.duration(280).delay(150 + (folders.length + index) * 50)}
-                      layout={isWeb ? undefined : Layout.springify()}
-                      key={folder.id}>
+                      key={folder.id}
+                      entering={isWeb ? undefined : FadeInDown.duration(280).delay(150 + (topLevelFolders.length + index) * 50)}>
                       <Pressable
                         onPress={() => onSelectFolder(folder.id)}
                         style={({ pressed }) => [
@@ -4359,6 +4908,126 @@ function NotesView({
                   </Animated.View>
                 )}
               </View>
+
+              {/* Subfolders Section - Shows subfolders of selected folder */}
+              {(() => {
+                // Only show subfolders if a folder is selected
+                if (!selectedFolderId || selectedFolderId === 'shared') return null;
+
+                // Find the selected folder - could be a top-level folder or a subfolder
+                let selectedFolder = [...topLevelFolders, ...topLevelSharedFolders].find(f => f.id === selectedFolderId);
+
+                // If not found in top-level, search in all folders (including subfolders)
+                if (!selectedFolder) {
+                  selectedFolder = [...folders, ...sharedFolders].find(f => f.id === selectedFolderId);
+                }
+
+                if (!selectedFolder) return null;
+
+                // Determine if the selected folder is from own or shared folders
+                const isSelectedInOwnFolders = folders.some(f => f.id === selectedFolderId);
+                const subfolders = isSelectedInOwnFolders
+                  ? getSubfolders(selectedFolderId, folders)
+                  : getSubfolders(selectedFolderId, sharedFolders);
+
+                if (subfolders.length === 0) return null;
+
+                const allExpandedSubfolders = subfolders.map(subfolder => ({
+                  folder: subfolder,
+                  parentFolder: selectedFolder
+                }));
+
+                return (
+                  <Animated.View
+                    entering={isWeb ? undefined : FadeInDown.duration(250)}
+                    style={{ marginTop: 16 }}>
+                    <View style={[styles.sectionHeader, { marginBottom: 12 }]}>
+                      <View style={styles.sectionHeaderLeft}>
+                        <View style={[styles.sectionIconBox, { backgroundColor: '#6366f115' }]}>
+                          <Ionicons name="folder-open" size={18} color="#6366f1" />
+                        </View>
+                        <Text style={styles.modernSectionTitle}>
+                          Subfolders in {selectedFolder.name}
+                        </Text>
+                        <View style={[styles.sectionBadge, { backgroundColor: '#6366f112' }]}>
+                          <Text style={[styles.sectionBadgeText, { color: '#6366f1' }]}>{allExpandedSubfolders.length}</Text>
+                        </View>
+                      </View>
+                    </View>
+                    <View style={styles.ultraFoldersGrid}>
+                      {allExpandedSubfolders.map(({ folder: subfolder, parentFolder }, idx) => {
+                        const subfolderNoteCount = [...notes, ...sharedNotes].filter((n) => n.folder_id === subfolder.id).length;
+                        const isSharedFolder = sharedFolders.some((sf) => sf.id === subfolder.id);
+
+                        return (
+                          <Animated.View
+                            key={subfolder.id}
+                            entering={isWeb ? undefined : FadeInDown.duration(200).delay(idx * 30)}>
+                            <Pressable
+                              onPress={() => onSelectFolder(subfolder.id)}
+                              style={({ pressed }) => [
+                                styles.ultraFolderCard,
+                                { minHeight: 90 },
+                                selectedFolderId === subfolder.id && [
+                                  styles.ultraFolderCardActive,
+                                  {
+                                    backgroundColor: (subfolder.color || parentFolder.color || ACCENT) + '08',
+                                    borderColor: subfolder.color || parentFolder.color || ACCENT,
+                                  }
+                                ],
+                                pressed && styles.ultraFolderCardPressed,
+                              ]}>
+                              {selectedFolderId === subfolder.id && (
+                                <View style={[styles.ultraFolderGradient, { backgroundColor: subfolder.color || parentFolder.color || ACCENT }]} />
+                              )}
+
+                              <View style={styles.ultraFolderContent}>
+                                <View style={styles.ultraFolderTop}>
+                                  <View style={[styles.ultraFolderIcon, { backgroundColor: (subfolder.color || parentFolder.color || ACCENT) + '20', width: 44, height: 44 }]}>
+                                    <Ionicons name={(subfolder.icon as any) || 'folder-outline'} size={22} color={subfolder.color || parentFolder.color || ACCENT} />
+                                  </View>
+                                  <View style={styles.ultraFolderTopRight}>
+                                    <View style={styles.ultraFolderBadge}>
+                                      <Ionicons name="document-text" size={12} color="#64748b" />
+                                      <Text style={styles.ultraFolderBadgeText}>{subfolderNoteCount}</Text>
+                                    </View>
+                                    {isSharedFolder && (
+                                      <View style={[styles.sharedFolderIndicator, { marginLeft: 4 }]}>
+                                        <Ionicons name="people" size={12} color="#10b981" />
+                                      </View>
+                                    )}
+                                    <Pressable
+                                      onPress={(e) => {
+                                        e.stopPropagation();
+                                        setEditingFolder(subfolder);
+                                        setShowEditFolderOverlay(true);
+                                      }}
+                                      style={({ pressed }) => [
+                                        styles.folderEditButton,
+                                        pressed && styles.folderEditButtonPressed,
+                                      ]}>
+                                      <Ionicons name="ellipsis-horizontal" size={18} color="#94a3b8" />
+                                    </Pressable>
+                                  </View>
+                                </View>
+
+                                <View style={styles.ultraFolderInfo}>
+                                  <Text style={[styles.ultraFolderName, { fontSize: 14 }]} numberOfLines={1}>
+                                    {subfolder.name}
+                                  </Text>
+                                  <Text style={[styles.ultraFolderDate, { fontSize: 11 }]}>
+                                    in {parentFolder.name}
+                                  </Text>
+                                </View>
+                              </View>
+                            </Pressable>
+                          </Animated.View>
+                        );
+                      })}
+                    </View>
+                  </Animated.View>
+                );
+              })()}
             </Animated.View>
           )}
 
@@ -4681,8 +5350,8 @@ function ShareModal({
         exiting={isWeb ? undefined : ZoomOut.duration(150)}
         style={styles.shareModalContent}>
         <View style={styles.shareModalHeader}>
-          <View>
-            <Text style={styles.shareModalTitle}>{displayTitle}</Text>
+          <View style={{ flex: 1, marginRight: 12 }}>
+            <Text style={styles.shareModalTitle} numberOfLines={2} ellipsizeMode="tail">{displayTitle}</Text>
             <Text style={styles.shareModalSubtitle}>Collaborate with other users</Text>
           </View>
           <Pressable onPress={onClose} style={styles.modalCloseButton}>
@@ -5523,44 +6192,30 @@ const styles = StyleSheet.create({
     color: '#64748b',
   },
   createButton: {
-    position: 'relative',
     flexDirection: 'row',
     alignItems: 'center',
+    justifyContent: 'center',
     gap: 8,
-    paddingHorizontal: 20,
-    paddingVertical: 12,
-    borderRadius: 14,
+    paddingHorizontal: 24,
+    paddingVertical: 14,
+    borderRadius: 12,
     backgroundColor: ACCENT,
-    overflow: 'hidden',
-    shadowColor: ACCENT,
-    shadowOpacity: 0.4,
-    shadowOffset: { width: 0, height: 8 },
-    shadowRadius: 20,
+    shadowColor: '#000',
+    shadowOpacity: 0.15,
+    shadowOffset: { width: 0, height: 2 },
+    shadowRadius: 8,
+    elevation: 3,
   },
   createButtonGlow: {
-    position: 'absolute',
-    top: -20,
-    left: -20,
-    right: -20,
-    bottom: -20,
-    backgroundColor: ACCENT,
-    opacity: 0.3,
-    borderRadius: 34,
+    display: 'none',
   },
   createButtonText: {
-    fontSize: 14,
+    fontSize: 15,
     fontWeight: '700',
     color: '#ffffff',
-    letterSpacing: -0.2,
   },
   createButtonShine: {
-    position: 'absolute',
-    top: 0,
-    left: 0,
-    right: 0,
-    height: '50%',
-    backgroundColor: '#ffffff',
-    opacity: 0.15,
+    display: 'none',
   },
   progressBar: {
     height: 4,
