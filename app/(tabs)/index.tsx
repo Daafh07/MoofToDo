@@ -1,4 +1,5 @@
-import { Ionicons } from '@expo/vector-icons';
+import { Ionicons, MaterialIcons } from '@expo/vector-icons';
+import * as ImagePicker from 'expo-image-picker';
 import { StatusBar } from 'expo-status-bar';
 import React, { useEffect, useMemo, useRef, useState } from 'react';
 import {
@@ -997,12 +998,12 @@ function AppShell({ session, onSignOut }: AppShellProps) {
     setShareLoading(true);
     try {
       // Check if already shared
-      const { data: existing, error: checkError } = await supabase
-        .from('folder_collaborators')
-        .select('*')
-        .eq('folder_id', folderId)
-        .eq('user_id', userId)
-        .maybeSingle();
+    const { data: existing } = await supabase
+      .from('folder_collaborators')
+      .select('*')
+      .eq('folder_id', folderId)
+      .eq('user_id', userId)
+      .maybeSingle();
 
       if (existing) {
         setAlertMessage({
@@ -2582,7 +2583,7 @@ function AppShell({ session, onSignOut }: AppShellProps) {
             {/* Title & Message */}
             <Text style={styles.deleteConfirmTitle}>Delete Folder?</Text>
             <Text style={styles.deleteConfirmMessage}>
-              Are you sure you want to delete "{folderToDelete.name}"? Notes in this folder will be moved to "No Folder".
+              Are you sure you want to delete &quot;{folderToDelete.name}&quot;? Notes in this folder will be moved to &quot;No Folder&quot;.
             </Text>
 
             {/* Actions */}
@@ -3488,8 +3489,6 @@ function NotesView({
       : selectedFolderId
         ? [...notes, ...sharedNotes].filter((n) => n.folder_id === selectedFolderId)
         : looseNotes;
-  const { width: windowWidth } = useWindowDimensions();
-  const isSmallDevice = windowWidth < 400;
   const [showSearchBar, setShowSearchBar] = useState(false);
   const colors = [
     '#4f46e5', // Indigo
@@ -3579,19 +3578,28 @@ function NotesView({
   const [richLib, setRichLib] = useState<{ RichEditor: any; RichToolbar: any; actions: any } | null>(null);
   const richRef = useRef<any | null>(null);
   const webEditorRef = useRef<HTMLDivElement | null>(null);
+  const webFileInputRef = useRef<HTMLInputElement | null>(null);
   const savedWebRange = useRef<Range | null>(null);
-  const [inlineStates, setInlineStates] = useState({
-    bold: false,
-    italic: false,
-    underline: false,
-  });
-  const [webStates, setWebStates] = useState({
+  const [selectedImage, setSelectedImage] = useState<HTMLImageElement | null>(null);
+  const DEFAULT_IMAGE_WIDTH = 260;
+  type WebStates = {
+    bold: boolean;
+    italic: boolean;
+    underline: boolean;
+    list: boolean;
+    h1: boolean;
+    h2: boolean;
+    h3: boolean;
+    highlight: boolean;
+  };
+  const [webStates, setWebStates] = useState<WebStates>({
     bold: false,
     italic: false,
     underline: false,
     list: false,
     h1: false,
     h2: false,
+    h3: false,
     highlight: false,
   });
 
@@ -3636,7 +3644,7 @@ function NotesView({
     };
   }, [isDraggingPicker, isWeb]);
 
-  const computeWebStates = () => {
+  const computeWebStates = (): Partial<WebStates> => {
     const bold = document.queryCommandState('bold') || false;
     const italic = document.queryCommandState('italic') || false;
     const underline = document.queryCommandState('underline') || false;
@@ -3649,6 +3657,7 @@ function NotesView({
       list,
       h1: block === 'h1',
       h2: block === 'h2',
+      h3: block === 'h3',
       // highlight is managed separately, don't include it here
     };
   };
@@ -3670,6 +3679,94 @@ function NotesView({
       sel.removeAllRanges();
       sel.addRange(savedWebRange.current);
     }
+  };
+
+  const ensureWebImageSizing = () => {
+    if (!isWeb) return;
+    const editor = webEditorRef.current;
+    if (!editor) return;
+    const imgs = editor.querySelectorAll<HTMLImageElement>('img');
+    imgs.forEach((img) => {
+      if (!img.getAttribute('data-moof-size')) {
+        img.style.maxWidth = '100%';
+        img.style.width = `${DEFAULT_IMAGE_WIDTH}px`;
+        img.style.height = 'auto';
+        img.style.float = img.style.float || 'none';
+        img.style.display = img.style.float === 'none' ? 'block' : 'inline-block';
+        img.style.margin = img.style.float === 'left'
+          ? '12px 16px 12px 0'
+          : img.style.float === 'right'
+            ? '12px 0 12px 16px'
+            : '12px auto';
+        img.setAttribute('data-moof-size', '1');
+      }
+    });
+  };
+
+  // Image insert helpers (web + native)
+  const handleWebFileChange = (e: React.ChangeEvent<HTMLInputElement>) => {
+    const file = e.target.files?.[0];
+    if (!file) return;
+    const reader = new FileReader();
+    reader.onload = () => {
+      const dataUrl = reader.result as string;
+      runWebCommand('insertImage', dataUrl);
+      ensureWebImageSizing();
+    };
+    reader.readAsDataURL(file);
+    e.target.value = '';
+  };
+
+  const pickImageNative = async () => {
+    const permission = await ImagePicker.requestMediaLibraryPermissionsAsync();
+    if (permission.status !== 'granted') {
+      Alert.alert('Toegang nodig', 'Geef toestemming tot je foto’s om een afbeelding toe te voegen.');
+      return;
+    }
+    const result = await ImagePicker.launchImageLibraryAsync({
+      mediaTypes: ImagePicker.MediaTypeOptions.Images,
+      quality: 0.8,
+      base64: false,
+    });
+    if (result.canceled) return;
+    const asset = result.assets?.[0];
+    if (asset?.uri && richRef.current?.insertImage) {
+      richRef.current.insertImage(asset.uri);
+    }
+  };
+
+  const handleInsertImage = () => {
+    if (isWeb) {
+      webFileInputRef.current?.click();
+    } else {
+      void pickImageNative();
+    }
+  };
+
+  const adjustImageSize = (delta: number) => {
+    if (!selectedImage) return;
+    const currentWidth =
+      parseFloat(selectedImage.style.width || '') || selectedImage.getBoundingClientRect().width || DEFAULT_IMAGE_WIDTH;
+    const nextWidth = Math.max(120, Math.min(900, currentWidth + delta));
+    selectedImage.style.width = `${nextWidth}px`;
+    selectedImage.style.maxWidth = '100%';
+    selectedImage.style.height = 'auto';
+    selectedImage.style.display = selectedImage.style.float === 'none' ? 'block' : 'inline-block';
+    selectedImage.style.margin = selectedImage.style.float === 'left'
+      ? '12px 16px 12px 0'
+      : selectedImage.style.float === 'right'
+        ? '12px 0 12px 16px'
+        : '12px auto';
+    selectedImage.setAttribute('data-moof-size', '1');
+    if (webEditorRef.current) {
+      onChangeNoteBody(webEditorRef.current.innerHTML ?? '');
+    }
+  };
+
+  const resetImageSize = () => {
+    adjustImageSize(DEFAULT_IMAGE_WIDTH - (selectedImage
+      ? parseFloat(selectedImage.style.width || '') || selectedImage.getBoundingClientRect().width || DEFAULT_IMAGE_WIDTH
+      : DEFAULT_IMAGE_WIDTH));
   };
 
   const isClient = typeof window !== 'undefined';
@@ -3718,6 +3815,35 @@ function NotesView({
       document.removeEventListener('selectionchange', handleSelectionWithRange);
     };
   }, []);
+
+  useEffect(() => {
+    if (!isWeb) return;
+    const editor = webEditorRef.current;
+    if (!editor) return;
+
+    const handleClick = (e: MouseEvent) => {
+      const target = e.target as HTMLElement | null;
+      const img = target?.closest('img');
+      if (img && editor.contains(img)) {
+        setSelectedImage(img as HTMLImageElement);
+      } else {
+        setSelectedImage(null);
+      }
+      ensureWebImageSizing();
+    };
+
+    const handleInput = () => {
+      ensureWebImageSizing();
+    };
+
+    editor.addEventListener('click', handleClick);
+    editor.addEventListener('input', handleInput);
+    ensureWebImageSizing();
+    return () => {
+      editor.removeEventListener('click', handleClick);
+      editor.removeEventListener('input', handleInput);
+    };
+  }, [isWeb, noteModalOpen]);
 
   // Enforce formatting state before and during input - if a format is OFF, actively remove it
   useEffect(() => {
@@ -3796,6 +3922,7 @@ function NotesView({
       }
       if (isWeb && webEditorRef.current) {
         webEditorRef.current.innerHTML = noteBody || '';
+        ensureWebImageSizing();
       }
     }
   }, [noteModalOpen, editingNote?.id, isWeb]);
@@ -3836,6 +3963,9 @@ function NotesView({
       restoreSelection();
       editor.focus();
       document.execCommand(cmd, false, value);
+      if (cmd === 'insertImage') {
+        ensureWebImageSizing();
+      }
       const html = editor.innerHTML ?? '';
       onChangeNoteBody(html);
       // Update states immediately after command
@@ -4105,185 +4235,207 @@ function NotesView({
             <Text style={{ fontSize: 13, fontWeight: '600', color: '#6b7280', marginBottom: 12 }}>FORMATTING</Text>
             {isWeb ? (
               <View style={{ position: 'relative', overflow: 'visible', zIndex: 9998 }}>
-                <ScrollView
-                  horizontal
-                  showsHorizontalScrollIndicator={false}
-                  style={{ overflow: 'visible' }}
-                  contentContainerStyle={{ gap: 8, paddingVertical: 8 }}>
-                  {/* Text Formatting */}
-                  <Pressable
-                    style={[styles.toolbarButton, webStates.bold && { backgroundColor: '#e5e7ff', borderColor: ACCENT }]}
-                    onPressIn={(e) => {
-                      e.preventDefault?.();
-                      toggleInlineCommand('bold');
-                    }}>
-                    <Ionicons name="text" size={16} color={webStates.bold ? ACCENT : '#6b7280'} style={{ fontWeight: '900' }} />
-                    <Text style={[styles.toolbarButtonText, { fontWeight: '900' }]}>B</Text>
-                  </Pressable>
-                  <Pressable
-                    style={[styles.toolbarButton, webStates.italic && { backgroundColor: '#e5e7ff', borderColor: ACCENT }]}
-                    onPressIn={(e) => {
-                      e.preventDefault?.();
-                      toggleInlineCommand('italic');
-                    }}>
-                    <Text style={[styles.toolbarButtonText, { fontStyle: 'italic', fontWeight: '600' }]}>I</Text>
-                  </Pressable>
-                  <Pressable
-                    style={[styles.toolbarButton, webStates.underline && { backgroundColor: '#e5e7ff', borderColor: ACCENT }]}
-                    onPressIn={(e) => {
-                      e.preventDefault?.();
-                      toggleInlineCommand('underline');
-                    }}>
-                    <Text style={[styles.toolbarButtonText, { textDecorationLine: 'underline' }]}>U</Text>
-                  </Pressable>
-
-                  {/* Divider */}
-                  <View style={{ width: 1, height: 24, backgroundColor: '#e5e7eb', marginHorizontal: 4 }} />
-
-                  {/* Headings */}
-                  <Pressable
-                    style={[styles.toolbarButton, webStates.h1 && { backgroundColor: '#e5e7ff', borderColor: ACCENT }]}
-                    onPressIn={(e) => {
-                      e.preventDefault?.();
-                      const nextBlock = webStates.h1 ? 'p' : 'h1';
-                      runWebCommand('formatBlock', nextBlock);
-                    }}>
-                    <Text style={[styles.toolbarButtonText, { fontSize: 15, fontWeight: '700' }]}>H1</Text>
-                  </Pressable>
-                  <Pressable
-                    style={[styles.toolbarButton, webStates.h2 && { backgroundColor: '#e5e7ff', borderColor: ACCENT }]}
-                    onPressIn={(e) => {
-                      e.preventDefault?.();
-                      const nextBlock = webStates.h2 ? 'p' : 'h2';
-                      runWebCommand('formatBlock', nextBlock);
-                    }}>
-                    <Text style={[styles.toolbarButtonText, { fontSize: 14, fontWeight: '700' }]}>H2</Text>
-                  </Pressable>
-                  <Pressable
-                    style={[styles.toolbarButton, webStates.h3 && { backgroundColor: '#e5e7ff', borderColor: ACCENT }]}
-                    onPressIn={(e) => {
-                      e.preventDefault?.();
-                      const nextBlock = webStates.h3 ? 'p' : 'h3';
-                      runWebCommand('formatBlock', nextBlock);
-                    }}>
-                    <Text style={[styles.toolbarButtonText, { fontSize: 13, fontWeight: '700' }]}>H3</Text>
-                  </Pressable>
-
-                  {/* Divider */}
-                  <View style={{ width: 1, height: 24, backgroundColor: '#e5e7eb', marginHorizontal: 4 }} />
-
-                  {/* Lists */}
-                  <Pressable
-                    style={[styles.toolbarButton, webStates.list && { backgroundColor: '#e5e7ff', borderColor: ACCENT }]}
-                    onPressIn={(e) => {
-                      e.preventDefault?.();
-                      runWebCommand('insertUnorderedList');
-                    }}>
-                    <Ionicons name="list" size={16} color={webStates.list ? ACCENT : '#6b7280'} />
-                  </Pressable>
-                  <Pressable
-                    style={[styles.toolbarButton]}
-                    onPressIn={(e) => {
-                      e.preventDefault?.();
-                      runWebCommand('insertOrderedList');
-                    }}>
-                    <Ionicons name="list-outline" size={16} color="#6b7280" />
-                  </Pressable>
-
-                  {/* Divider */}
-                  <View style={{ width: 1, height: 24, backgroundColor: '#e5e7eb', marginHorizontal: 4 }} />
-
-                  {/* Alignment */}
-                  <Pressable
-                    style={[styles.toolbarButton]}
-                    onPressIn={(e) => {
-                      e.preventDefault?.();
-                      runWebCommand('justifyLeft');
-                    }}>
-                    <Ionicons name="align-horizontal-left" size={16} color="#6b7280" />
-                  </Pressable>
-                  <Pressable
-                    style={[styles.toolbarButton]}
-                    onPressIn={(e) => {
-                      e.preventDefault?.();
-                      runWebCommand('justifyCenter');
-                    }}>
-                    <Ionicons name="align-horizontal-center" size={16} color="#6b7280" />
-                  </Pressable>
-                  <Pressable
-                    style={[styles.toolbarButton]}
-                    onPressIn={(e) => {
-                      e.preventDefault?.();
-                      runWebCommand('justifyRight');
-                    }}>
-                    <Ionicons name="align-horizontal-right" size={16} color="#6b7280" />
-                  </Pressable>
-
-                  {/* Divider */}
-                  <View style={{ width: 1, height: 24, backgroundColor: '#e5e7eb', marginHorizontal: 4 }} />
-
-                  {/* Highlight button with color picker */}
-                  <View style={{ flexDirection: 'row', alignItems: 'center', gap: 6 }}>
+                {selectedImage ? (
+                  <ScrollView
+                    horizontal
+                    showsHorizontalScrollIndicator={false}
+                    style={{ overflow: 'visible' }}
+                    contentContainerStyle={{ gap: 8, paddingVertical: 8 }}>
+                    <View style={{ flexDirection: 'row', alignItems: 'center', gap: 6 }}>
+                      <Text style={[styles.toolbarButtonText, { color: '#6b7280', fontWeight: '600' }]}>Afbeelding</Text>
+                      <Pressable
+                        style={[styles.toolbarButton]}
+                        onPressIn={(e) => {
+                          e.preventDefault?.();
+                          adjustImageSize(-40);
+                        }}>
+                        <Ionicons name="remove-circle-outline" size={16} color="#6b7280" />
+                      </Pressable>
+                      <Pressable
+                        style={[styles.toolbarButton]}
+                        onPressIn={(e) => {
+                          e.preventDefault?.();
+                          resetImageSize();
+                        }}>
+                        <Ionicons name="refresh-outline" size={16} color="#6b7280" />
+                      </Pressable>
+                      <Pressable
+                        style={[styles.toolbarButton]}
+                        onPressIn={(e) => {
+                          e.preventDefault?.();
+                          adjustImageSize(40);
+                        }}>
+                        <Ionicons name="add-circle-outline" size={16} color="#6b7280" />
+                      </Pressable>
+                    </View>
+                  </ScrollView>
+                ) : (
+                  <ScrollView
+                    horizontal
+                    showsHorizontalScrollIndicator={false}
+                    style={{ overflow: 'visible' }}
+                    contentContainerStyle={{ gap: 8, paddingVertical: 8 }}>
+                    {/* Text Formatting */}
                     <Pressable
-                      style={[
-                        styles.toolbarButton,
-                        webStates.highlight && { backgroundColor: '#fef3c7', borderColor: '#f59e0b' }
-                      ]}
+                      style={[styles.toolbarButton, webStates.bold && { backgroundColor: '#e5e7ff', borderColor: ACCENT }]}
                       onPressIn={(e) => {
                         e.preventDefault?.();
-                        toggleHighlight();
+                        toggleInlineCommand('bold');
                       }}>
-                      <Ionicons name="color-fill" size={16} color={webStates.highlight ? '#f59e0b' : '#6b7280'} />
+                      <Text style={[styles.toolbarButtonText, { fontWeight: '900' }]}>B</Text>
                     </Pressable>
                     <Pressable
-                      style={{
-                        width: 24,
-                        height: 24,
-                        borderRadius: 6,
-                        backgroundColor: highlightColor,
-                        borderWidth: 2,
-                        borderColor: '#d1d5db',
-                      }}
-                      onPress={() => setShowColorPicker(!showColorPicker)}
-                    />
-                  </View>
+                      style={[styles.toolbarButton, webStates.italic && { backgroundColor: '#e5e7ff', borderColor: ACCENT }]}
+                      onPressIn={(e) => {
+                        e.preventDefault?.();
+                        toggleInlineCommand('italic');
+                      }}>
+                      <Text style={[styles.toolbarButtonText, { fontStyle: 'italic', fontWeight: '600' }]}>I</Text>
+                    </Pressable>
+                    <Pressable
+                      style={[styles.toolbarButton, webStates.underline && { backgroundColor: '#e5e7ff', borderColor: ACCENT }]}
+                      onPressIn={(e) => {
+                        e.preventDefault?.();
+                        toggleInlineCommand('underline');
+                      }}>
+                      <Text style={[styles.toolbarButtonText, { textDecorationLine: 'underline' }]}>U</Text>
+                    </Pressable>
 
-                  {/* Divider */}
-                  <View style={{ width: 1, height: 24, backgroundColor: '#e5e7eb', marginHorizontal: 4 }} />
+                    {/* Divider */}
+                    <View style={{ width: 1, height: 24, backgroundColor: '#e5e7eb', marginHorizontal: 4 }} />
 
-                  {/* Link */}
-                  <Pressable
-                    style={[styles.toolbarButton]}
-                    onPressIn={(e) => {
-                      e.preventDefault?.();
-                      const url = prompt('Enter URL:');
-                      if (url) {
-                        runWebCommand('createLink', url);
-                      }
-                    }}>
-                    <Ionicons name="link" size={16} color="#6b7280" />
-                  </Pressable>
+                    {/* Headings */}
+                    <Pressable
+                      style={[styles.toolbarButton, webStates.h1 && { backgroundColor: '#e5e7ff', borderColor: ACCENT }]}
+                      onPressIn={(e) => {
+                        e.preventDefault?.();
+                        const nextBlock = webStates.h1 ? 'p' : 'h1';
+                        runWebCommand('formatBlock', nextBlock);
+                      }}>
+                      <Text style={[styles.toolbarButtonText, { fontSize: 15, fontWeight: '700' }]}>H1</Text>
+                    </Pressable>
+                    <Pressable
+                      style={[styles.toolbarButton, webStates.h2 && { backgroundColor: '#e5e7ff', borderColor: ACCENT }]}
+                      onPressIn={(e) => {
+                        e.preventDefault?.();
+                        const nextBlock = webStates.h2 ? 'p' : 'h2';
+                        runWebCommand('formatBlock', nextBlock);
+                      }}>
+                      <Text style={[styles.toolbarButtonText, { fontSize: 14, fontWeight: '700' }]}>H2</Text>
+                    </Pressable>
+                    <Pressable
+                      style={[styles.toolbarButton, webStates.h3 && { backgroundColor: '#e5e7ff', borderColor: ACCENT }]}
+                      onPressIn={(e) => {
+                        e.preventDefault?.();
+                        const nextBlock = webStates.h3 ? 'p' : 'h3';
+                        runWebCommand('formatBlock', nextBlock);
+                      }}>
+                      <Text style={[styles.toolbarButtonText, { fontSize: 13, fontWeight: '700' }]}>H3</Text>
+                    </Pressable>
 
-                  {/* Code */}
-                  <Pressable
-                    style={[styles.toolbarButton]}
-                    onPressIn={(e) => {
-                      e.preventDefault?.();
-                      runWebCommand('formatBlock', 'pre');
-                    }}>
-                    <Ionicons name="code-slash" size={16} color="#6b7280" />
-                  </Pressable>
+                    {/* Divider */}
+                    <View style={{ width: 1, height: 24, backgroundColor: '#e5e7eb', marginHorizontal: 4 }} />
 
-                  {/* Quote */}
-                  <Pressable
-                    style={[styles.toolbarButton]}
-                    onPressIn={(e) => {
-                      e.preventDefault?.();
-                      runWebCommand('formatBlock', 'blockquote');
-                    }}>
-                    <Ionicons name="quote" size={16} color="#6b7280" />
-                  </Pressable>
-                </ScrollView>
+                    {/* Lists */}
+                    <Pressable
+                      style={[styles.toolbarButton, webStates.list && { backgroundColor: '#e5e7ff', borderColor: ACCENT }]}
+                      onPressIn={(e) => {
+                        e.preventDefault?.();
+                        runWebCommand('insertUnorderedList');
+                      }}>
+                      <Ionicons name="list-circle-outline" size={16} color={webStates.list ? ACCENT : '#6b7280'} />
+                    </Pressable>
+                    <Pressable
+                      style={[styles.toolbarButton]}
+                      onPressIn={(e) => {
+                        e.preventDefault?.();
+                        runWebCommand('insertOrderedList');
+                      }}>
+                      <Ionicons name="reorder-two-outline" size={16} color="#6b7280" />
+                    </Pressable>
+
+                    {/* Divider */}
+                    <View style={{ width: 1, height: 24, backgroundColor: '#e5e7eb', marginHorizontal: 4 }} />
+
+                    {/* Alignment */}
+                    <Pressable
+                      style={[styles.toolbarButton]}
+                      onPressIn={(e) => {
+                        e.preventDefault?.();
+                        runWebCommand('justifyLeft');
+                      }}>
+                      <MaterialIcons name="format-align-left" size={18} color="#6b7280" />
+                    </Pressable>
+                    <Pressable
+                      style={[styles.toolbarButton]}
+                      onPressIn={(e) => {
+                        e.preventDefault?.();
+                        runWebCommand('justifyCenter');
+                      }}>
+                      <MaterialIcons name="format-align-center" size={18} color="#6b7280" />
+                    </Pressable>
+                    <Pressable
+                      style={[styles.toolbarButton]}
+                      onPressIn={(e) => {
+                        e.preventDefault?.();
+                        runWebCommand('justifyRight');
+                      }}>
+                      <MaterialIcons name="format-align-right" size={18} color="#6b7280" />
+                    </Pressable>
+
+                    {/* Divider */}
+                    <View style={{ width: 1, height: 24, backgroundColor: '#e5e7eb', marginHorizontal: 4 }} />
+
+                    {/* Highlight button with color picker */}
+                    <View style={{ flexDirection: 'row', alignItems: 'center', gap: 6 }}>
+                      <Pressable
+                        style={[
+                          styles.toolbarButton,
+                          webStates.highlight && { backgroundColor: '#fef3c7', borderColor: '#f59e0b' }
+                        ]}
+                        onPressIn={(e) => {
+                          e.preventDefault?.();
+                          toggleHighlight();
+                        }}>
+                        <Ionicons name="color-fill" size={16} color={webStates.highlight ? '#f59e0b' : '#6b7280'} />
+                      </Pressable>
+                      <Pressable
+                        style={{
+                          width: 24,
+                          height: 24,
+                          borderRadius: 6,
+                          backgroundColor: highlightColor,
+                          borderWidth: 2,
+                          borderColor: '#d1d5db',
+                        }}
+                        onPress={() => setShowColorPicker(!showColorPicker)}
+                      />
+                    </View>
+
+                    {/* Divider */}
+                    <View style={{ width: 1, height: 24, backgroundColor: '#e5e7eb', marginHorizontal: 4 }} />
+
+                    {/* Afbeelding toevoegen */}
+                    <Pressable
+                      style={[styles.toolbarButton]}
+                      onPressIn={(e) => {
+                        e.preventDefault?.();
+                        handleInsertImage();
+                      }}>
+                      <Ionicons name="image-outline" size={16} color="#6b7280" />
+                    </Pressable>
+                  </ScrollView>
+                )}
+                {/* Hidden file input for web image insert */}
+                {isWeb && (
+                  <input
+                    type="file"
+                    accept="image/*"
+                    ref={webFileInputRef}
+                    style={{ display: 'none' }}
+                    onChange={handleWebFileChange}
+                  />
+                )}
               </View>
             ) : richLib?.RichToolbar && richLib?.actions ? (
               <richLib.RichToolbar
@@ -4304,9 +4456,16 @@ function NotesView({
                   richLib.actions.setStrikethrough,
                   richLib.actions.foreColor,
                   richLib.actions.hiliteColor,
+                  richLib.actions.insertImage,
                 ]}
+                insertImage={handleInsertImage}
                 selectedIconTint={ACCENT}
                 iconTint="#1f2937"
+                iconMap={{
+                  [richLib.actions.insertImage]: () => (
+                    <Ionicons name="image-outline" size={18} color="#1f2937" />
+                  ),
+                }}
                 style={{
                   backgroundColor: '#fff',
                   borderRadius: 16,
@@ -4385,6 +4544,7 @@ function NotesView({
                     wordBreak: 'break-word',
                     textAlign: 'left',
                     display: 'block',
+                    position: 'relative',
                 }}
               />
             ) : (
