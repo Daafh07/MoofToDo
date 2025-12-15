@@ -35,6 +35,9 @@ type Task = {
   title: string;
   description?: string | null;
   is_done: boolean;
+  project?: string | null;
+  folder_id?: string | null;
+  created_at?: string;
 };
 
 type Reminder = {
@@ -329,7 +332,6 @@ type AppShellProps = {
 function AppShell({ session, onSignOut }: AppShellProps) {
   const [activeTab, setActiveTab] = useState<TabKey>('home');
   const [tasks, setTasks] = useState<Task[]>([]);
-  const [taskInput, setTaskInput] = useState('');
   const [tasksLoading, setTasksLoading] = useState(false);
   const [tasksError, setTasksError] = useState<string | null>(null);
   const [reminders, setReminders] = useState<Reminder[]>([]);
@@ -377,6 +379,11 @@ function AppShell({ session, onSignOut }: AppShellProps) {
   const [folderOverlayColor, setFolderOverlayColor] = useState<string | null>(null);
   const [folderOverlayIcon, setFolderOverlayIcon] = useState<string | null>('folder-outline');
   const [folderOverlayParentId, setFolderOverlayParentId] = useState<string | null>(null);
+  const [showTaskOverlay, setShowTaskOverlay] = useState(false);
+  const [taskOverlayTitle, setTaskOverlayTitle] = useState('');
+  const [taskOverlayDescription, setTaskOverlayDescription] = useState('');
+  const [taskOverlayProject, setTaskOverlayProject] = useState('');
+  const [taskOverlayFolderId, setTaskOverlayFolderId] = useState<string | null>(null);
   const [alertMessage, setAlertMessage] = useState<{
     title: string;
     message: string;
@@ -562,6 +569,7 @@ function AppShell({ session, onSignOut }: AppShellProps) {
     const { data, error } = await supabase
       .from('tasks')
       .select('*')
+      .eq('user_id', session?.user?.id)
       .order('created_at', { ascending: false });
 
     if (error) {
@@ -572,22 +580,98 @@ function AppShell({ session, onSignOut }: AppShellProps) {
     setTasksLoading(false);
   };
 
-  const addTask = async () => {
-    if (!taskInput.trim()) return;
+  const addTask = async (
+    title: string,
+    description?: string,
+    project?: string,
+    folderId?: string | null,
+  ): Promise<boolean> => {
+    if (!title.trim()) {
+      setTasksError('Vul eerst een titel in.');
+      return false;
+    }
+    if (!session?.user?.id) {
+      setTasksError('Je bent niet ingelogd.');
+      return false;
+    }
     setTasksLoading(true);
+    setTasksError(null);
 
-    const { error } = await supabase.from('tasks').insert({
-      title: taskInput.trim(),
-      user_id: session?.user?.id,
-    });
+    const payload: Record<string, any> = {
+      title: title.trim(),
+      description: description ?? '',
+      is_done: false,
+      user_id: session.user.id,
+    };
+    if (project?.trim()) {
+      payload.project = project.trim();
+    }
+    if (folderId) {
+      payload.folder_id = folderId;
+    }
+
+    let { error } = await supabase.from('tasks').insert([payload]);
+
+    // Fallback if the project column doesn't exist yet
+    if (error && error.message?.toLowerCase().includes('project')) {
+      console.warn('Project column missing on tasks table, retrying without it');
+      const { project: _ignored, ...fallbackPayload } = payload;
+      const retry = await supabase.from('tasks').insert([fallbackPayload]);
+      if (retry.error) {
+        error = retry.error;
+      } else {
+        setAlertMessage({
+          title: 'Project veld ontbreekt',
+          message: 'Voeg een "project" kolom toe aan de tasks tabel om groepen te gebruiken.',
+          type: 'warning',
+        });
+        error = null;
+      }
+    }
+
+    // Fallback if folder_id column is missing
+    if (error && error.message?.toLowerCase().includes('folder_id')) {
+      console.warn('folder_id column missing on tasks table, retrying without it');
+      const { folder_id: _ignoredFolder, ...fallbackPayload } = payload;
+      const retry = await supabase.from('tasks').insert([fallbackPayload]);
+      if (retry.error) {
+        error = retry.error;
+      } else {
+        setAlertMessage({
+          title: 'Folder veld ontbreekt',
+          message: 'Voeg een "folder_id" kolom toe aan de tasks tabel om de folder-structuur te gebruiken.',
+          type: 'warning',
+        });
+        error = null;
+      }
+    }
 
     if (error) {
+      console.warn('Add task failed', error);
       setTasksError(error.message);
       setTasksLoading(false);
-    } else {
-      setTaskInput('');
-      fetchTasks();
+      return false;
     }
+
+    await fetchTasks();
+    setTasksLoading(false);
+    return true;
+  };
+
+  const createTaskFromOverlay = async () => {
+    if (!taskOverlayTitle.trim() || tasksLoading) return;
+    const created = await addTask(
+      taskOverlayTitle,
+      taskOverlayDescription,
+      taskOverlayProject,
+      taskOverlayFolderId,
+    );
+    if (!created) return;
+    setTaskOverlayTitle('');
+    setTaskOverlayDescription('');
+    setTaskOverlayProject('');
+    setTaskOverlayFolderId(null);
+    setShowTaskOverlay(false);
   };
 
   const toggleTask = async (task: Task) => {
@@ -595,7 +679,8 @@ function AppShell({ session, onSignOut }: AppShellProps) {
     const { error } = await supabase
       .from('tasks')
       .update({ is_done: !task.is_done })
-      .eq('id', task.id);
+      .eq('id', task.id)
+      .eq('user_id', session?.user?.id);
 
     if (error) {
       setTasksError(error.message);
@@ -607,7 +692,11 @@ function AppShell({ session, onSignOut }: AppShellProps) {
 
   const deleteTask = async (taskId: string) => {
     setTasksLoading(true);
-    const { error } = await supabase.from('tasks').delete().eq('id', taskId);
+    const { error } = await supabase
+      .from('tasks')
+      .delete()
+      .eq('id', taskId)
+      .eq('user_id', session?.user?.id);
     if (error) {
       setTasksError(error.message);
       setTasksLoading(false);
@@ -1775,12 +1864,11 @@ function AppShell({ session, onSignOut }: AppShellProps) {
             tasks={tasks}
             loading={tasksLoading}
             error={tasksError}
-            value={taskInput}
-            onChangeValue={setTaskInput}
-            onAdd={addTask}
+            folders={folders}
+            sharedFolders={sharedFolders}
+            onOpenTaskOverlay={() => setShowTaskOverlay(true)}
             onToggle={toggleTask}
             onDelete={deleteTask}
-            onRefresh={fetchTasks}
           />
         );
       case 'agenda':
@@ -1936,8 +2024,8 @@ function AppShell({ session, onSignOut }: AppShellProps) {
         <BottomNav
           activeTab={activeTab}
           onSelectTab={setActiveTab}
-          onAddTask={addTask}
-          canAddTask={Boolean(taskInput.trim())}
+          onAddTask={() => setShowTaskOverlay(true)}
+          canAddTask={!tasksLoading}
         />
       )}
 
@@ -2013,6 +2101,167 @@ function AppShell({ session, onSignOut }: AppShellProps) {
                 }}>
                 <Ionicons name="trash-outline" size={18} color="#fff" />
                 <Text style={styles.deleteConfirmDeleteText}>Delete</Text>
+              </TouchableOpacity>
+            </View>
+          </Animated.View>
+        </Animated.View>
+      )}
+
+      {/* Create Task Overlay */}
+      {showTaskOverlay && (
+        <Animated.View
+          entering={isWeb ? undefined : FadeIn.duration(200)}
+          exiting={isWeb ? undefined : FadeOut.duration(150)}
+          style={[
+            styles.overlay,
+            isWeb && {
+              position: 'fixed' as any,
+            },
+          ]}>
+          <Pressable
+            style={styles.overlayBackdrop}
+            onPress={() => {
+              setShowTaskOverlay(false);
+              setTaskOverlayTitle('');
+              setTaskOverlayDescription('');
+              setTaskOverlayProject('');
+            }}
+          />
+          <Animated.View
+            entering={isWeb ? undefined : ZoomIn.duration(250).springify()}
+            exiting={isWeb ? undefined : ZoomOut.duration(180)}
+            style={styles.overlayCard}>
+            <Text style={styles.overlayTitle}>Add Task</Text>
+            <Text style={styles.overlaySubtitle}>Create a new task with a title and optional description.</Text>
+
+            <View style={{ marginTop: 20 }}>
+              <Text style={styles.overlayLabel}>Title</Text>
+              <TextInput
+                style={styles.overlayInput}
+                placeholder="Enter task title..."
+                placeholderTextColor="#9ca3af"
+                value={taskOverlayTitle}
+                onChangeText={setTaskOverlayTitle}
+                autoFocus
+              />
+            </View>
+
+            <View style={{ marginTop: 20 }}>
+              <Text style={styles.overlayLabel}>Description</Text>
+              <TextInput
+                style={[styles.overlayInput, { height: 90, textAlignVertical: 'top' }]}
+                placeholder="Optional description..."
+                placeholderTextColor="#9ca3af"
+                value={taskOverlayDescription}
+                onChangeText={setTaskOverlayDescription}
+                multiline
+              />
+            </View>
+
+            <View style={{ marginTop: 20, gap: 10 }}>
+              <Text style={styles.overlayLabel}>Project (optioneel)</Text>
+              <TextInput
+                style={styles.overlayInput}
+                placeholder="Bijv. 'Website redesign'"
+                placeholderTextColor="#9ca3af"
+                value={taskOverlayProject}
+                onChangeText={setTaskOverlayProject}
+              />
+              {tasks.length > 0 && (
+                <ScrollView horizontal showsHorizontalScrollIndicator={false} contentContainerStyle={{ gap: 8 }}>
+                  {Array.from(new Set(tasks.map((t) => (t.project?.trim() || 'Geen project')).filter(Boolean))).map((proj) => (
+                    <Pressable
+                      key={proj}
+                      onPress={() => setTaskOverlayProject(proj === 'Geen project' ? '' : proj)}
+                      style={[
+                        styles.chip,
+                        taskOverlayProject.trim() === proj && { backgroundColor: '#eef2ff', borderColor: 'transparent' },
+                      ]}>
+                      <Text
+                        style={[
+                          styles.chipText,
+                          taskOverlayProject.trim() === proj && { color: ACCENT, fontWeight: '700' },
+                        ]}>
+                        {proj}
+                      </Text>
+                    </Pressable>
+                  ))}
+                </ScrollView>
+              )}
+            </View>
+
+            <View style={{ marginTop: 20, gap: 10 }}>
+              <Text style={styles.overlayLabel}>Folder</Text>
+              <ScrollView horizontal showsHorizontalScrollIndicator={false} contentContainerStyle={{ gap: 8 }}>
+                <Pressable
+                  onPress={() => setTaskOverlayFolderId(null)}
+                  style={[
+                    styles.chip,
+                    !taskOverlayFolderId && { backgroundColor: '#eef2ff', borderColor: 'transparent' },
+                  ]}>
+                  <Text
+                    style={[
+                      styles.chipText,
+                      !taskOverlayFolderId && { color: ACCENT, fontWeight: '700' },
+                    ]}>
+                    Geen folder
+                  </Text>
+                </Pressable>
+                {[...folders, ...sharedFolders].map((folder) => (
+                  <Pressable
+                    key={folder.id}
+                    onPress={() => setTaskOverlayFolderId(folder.id)}
+                    style={[
+                      styles.chip,
+                      taskOverlayFolderId === folder.id && { backgroundColor: '#eef2ff', borderColor: 'transparent' },
+                    ]}>
+                    <Text
+                      style={[
+                        styles.chipText,
+                        taskOverlayFolderId === folder.id && { color: ACCENT, fontWeight: '700' },
+                      ]}>
+                      {folder.name}
+                    </Text>
+                  </Pressable>
+                ))}
+              </ScrollView>
+            </View>
+
+            <View style={styles.overlayActions}>
+              <TouchableOpacity
+                style={styles.overlayCancelButton}
+                onPress={() => {
+                  setShowTaskOverlay(false);
+                  setTaskOverlayTitle('');
+                  setTaskOverlayDescription('');
+                  setTaskOverlayProject('');
+                  setTaskOverlayFolderId(null);
+                }}>
+                <Text style={styles.overlayCancelText}>Cancel</Text>
+              </TouchableOpacity>
+              <TouchableOpacity
+                style={[
+                  styles.overlayCreateButton,
+                  (!taskOverlayTitle.trim() || tasksLoading) && styles.overlayCreateButtonDisabled,
+                ]}
+                disabled={!taskOverlayTitle.trim() || tasksLoading}
+                onPress={createTaskFromOverlay}>
+                {tasksLoading ? (
+                  <ActivityIndicator color="#fff" />
+                ) : (
+                  <Ionicons
+                    name="add-circle-outline"
+                    size={18}
+                    color={!taskOverlayTitle.trim() ? '#9ca3af' : '#fff'}
+                  />
+                )}
+                <Text
+                  style={[
+                    styles.overlayCreateText,
+                    (!taskOverlayTitle.trim() || tasksLoading) && styles.overlayCreateTextDisabled,
+                  ]}>
+                  Create
+                </Text>
               </TouchableOpacity>
             </View>
           </Animated.View>
@@ -2935,31 +3184,61 @@ type TasksViewProps = {
   tasks: Task[];
   loading: boolean;
   error: string | null;
-  value: string;
-  onChangeValue: (value: string) => void;
-  onAdd: () => void;
+  folders: NoteFolder[];
+  sharedFolders: NoteFolder[];
+  onOpenTaskOverlay: () => void;
   onToggle: (task: Task) => void;
   onDelete: (id: string) => void;
-  onRefresh: () => void;
 };
 
 function TasksView({
   tasks,
   loading,
   error,
-  value,
-  onChangeValue,
-  onAdd,
+  folders,
+  sharedFolders,
+  onOpenTaskOverlay,
   onToggle,
   onDelete,
-  onRefresh,
 }: TasksViewProps) {
   const [filter, setFilter] = useState<'all' | 'active' | 'completed'>('all');
+  const [folderFilter, setFolderFilter] = useState<string | 'none' | null>(null);
+  const folderNameMap = useMemo(() => {
+    const map: Record<string, string> = {};
+    [...folders, ...sharedFolders].forEach((f) => {
+      map[f.id] = f.name;
+    });
+    return map;
+  }, [folders, sharedFolders]);
   const filtered = tasks.filter((task) => {
-    if (filter === 'completed') return task.is_done;
-    if (filter === 'active') return !task.is_done;
-    return true;
+    const passesStatus =
+      filter === 'completed' ? task.is_done : filter === 'active' ? !task.is_done : true;
+    const normalizedFolder = task.folder_id ?? 'none';
+    const passesFolder =
+      folderFilter === null
+        ? true
+        : folderFilter === 'none'
+        ? !task.folder_id
+        : normalizedFolder === folderFilter;
+    return passesStatus && passesFolder;
   });
+
+  const groups = useMemo(() => {
+    const byFolder: Record<string, Task[]> = {};
+    filtered.forEach((task) => {
+      const key = task.folder_id ?? 'none';
+      if (!byFolder[key]) byFolder[key] = [];
+      byFolder[key].push(task);
+    });
+
+    return Object.entries(byFolder)
+      .map(([key, items]) => ({
+        key,
+        title: key === 'none' ? 'Geen folder' : folderNameMap[key] ?? 'Onbekende folder',
+        items,
+      }))
+      .sort((a, b) => a.title.localeCompare(b.title));
+  }, [filtered, folderNameMap]);
 
   return (
     <View style={{ gap: 16 }}>
@@ -2974,19 +3253,19 @@ function TasksView({
         entering={isWeb ? undefined : FadeInDown.delay(60).duration(220)}
         layout={isWeb ? undefined : Layout.springify()}
         style={[styles.card, { gap: 12 }]}>
-        <View style={styles.inputRow}>
-          <Ionicons name="add" size={18} color={ACCENT} />
-          <TextInput
-            placeholder="Add a new task..."
-            value={value}
-            onChangeText={onChangeValue}
-            style={styles.textInput}
-            placeholderTextColor="#9ca3af"
-          />
+        <View style={[styles.inputRow, { justifyContent: 'space-between' }]}>
+          <View>
+            <Text style={styles.inputLabel}>Tasks</Text>
+            <Text style={styles.subheading}>{tasks.length} totaal</Text>
+          </View>
           <TouchableOpacity
-            onPress={onAdd}
-            disabled={!value.trim() || loading}
-            style={[styles.primaryButton, { paddingHorizontal: 18, height: 44 }]}>
+            disabled={loading}
+            onPress={onOpenTaskOverlay}
+            style={[
+              styles.primaryButton,
+              { paddingHorizontal: 18, height: 44 },
+              loading && { opacity: 0.6 },
+            ]}>
             <Text style={styles.primaryButtonText}>Add Task</Text>
           </TouchableOpacity>
         </View>
@@ -3007,52 +3286,117 @@ function TasksView({
           ))}
         </View>
 
+        <View style={styles.chipsRow}>
+          <Pressable
+            onPress={() => setFolderFilter(null)}
+            style={[
+              styles.chip,
+              folderFilter === null && { backgroundColor: '#eef2ff', borderColor: 'transparent' },
+            ]}>
+            <Text
+              style={[
+                styles.chipText,
+                folderFilter === null && { color: ACCENT, fontWeight: '700' },
+              ]}>
+              Alle folders
+            </Text>
+          </Pressable>
+          <Pressable
+            onPress={() => setFolderFilter('none')}
+            style={[
+              styles.chip,
+              folderFilter === 'none' && { backgroundColor: '#eef2ff', borderColor: 'transparent' },
+            ]}>
+            <Text
+              style={[
+                styles.chipText,
+                folderFilter === 'none' && { color: ACCENT, fontWeight: '700' },
+              ]}>
+              Geen folder
+            </Text>
+          </Pressable>
+          {[...folders, ...sharedFolders].map((folder) => (
+            <Pressable
+              key={folder.id}
+              onPress={() => setFolderFilter(folder.id)}
+              style={[
+                styles.chip,
+                folderFilter === folder.id && { backgroundColor: '#eef2ff', borderColor: 'transparent' },
+              ]}>
+              <Text
+                style={[
+                  styles.chipText,
+                  folderFilter === folder.id && { color: ACCENT, fontWeight: '700' },
+                ]}>
+                {folder.name}
+              </Text>
+            </Pressable>
+          ))}
+        </View>
+
         {error ? <Text style={styles.errorText}>{error}</Text> : null}
 
         {loading ? (
           <ActivityIndicator color={ACCENT} />
+        ) : groups.length === 0 ? (
+          <Animated.View style={styles.emptyState} entering={isWeb ? undefined : FadeInDown.duration(200)}>
+            <Ionicons name="sparkles-outline" size={32} color={ACCENT} />
+            <Text style={styles.emptyText}>No tasks yet</Text>
+            <Text style={styles.metaText}>Add your first task to get started.</Text>
+          </Animated.View>
         ) : (
-          <Animated.FlatList
-            entering={isWeb ? undefined : FadeInDown.delay(90)}
-            scrollEnabled={false}
-            data={filtered}
-            keyExtractor={(item) => item.id}
-            ItemSeparatorComponent={() => <View style={{ height: 10 }} />}
-            renderItem={({ item }) => (
+          <View style={{ gap: 16 }}>
+            {groups.map((group, groupIndex) => (
               <Animated.View
-                entering={isWeb ? undefined : FadeInDown.duration(180)}
+                key={group.key}
+                entering={isWeb ? undefined : FadeInDown.delay(90 + groupIndex * 20)}
                 layout={isWeb ? undefined : Layout.springify()}
-                style={styles.taskCard}>
-                <Pressable onPress={() => onToggle(item)} style={styles.taskToggle}>
-                  <Ionicons
-                    name={item.is_done ? 'checkbox' : 'square-outline'}
-                    size={22}
-                    color={item.is_done ? ACCENT : '#4b5563'}
-                  />
-                  <View>
-                    <Text
-                      style={[
-                        styles.taskTitle,
-                        item.is_done && { textDecorationLine: 'line-through', color: MUTED },
-                      ]}>
-                      {item.title}
-                    </Text>
-                    <Text style={styles.taskSubtext}>{item.description ?? 'No description'}</Text>
-                  </View>
-                </Pressable>
-                <Pressable onPress={() => onDelete(item.id)} style={styles.iconButton}>
-                  <Ionicons name="trash-outline" size={16} color="#ef4444" />
-                </Pressable>
+                style={styles.taskGroup}>
+                <View style={styles.taskGroupHeader}>
+                  <Text style={styles.sectionTitle}>{group.title}</Text>
+                  <Text style={styles.metaText}>{group.items.length} item{group.items.length === 1 ? '' : 's'}</Text>
+                </View>
+                <View style={{ gap: 10 }}>
+                  {group.items.map((item) => (
+                    <Animated.View
+                      key={item.id}
+                      entering={isWeb ? undefined : FadeInDown.duration(180)}
+                      layout={isWeb ? undefined : Layout.springify()}
+                      style={styles.taskCard}>
+                      <Pressable onPress={() => onToggle(item)} style={styles.taskToggle}>
+                        <Ionicons
+                          name={item.is_done ? 'checkbox' : 'square-outline'}
+                          size={22}
+                          color={item.is_done ? ACCENT : '#4b5563'}
+                        />
+                        <View>
+                          <Text
+                            style={[
+                              styles.taskTitle,
+                              item.is_done && { textDecorationLine: 'line-through', color: MUTED },
+                            ]}>
+                            {item.title}
+                          </Text>
+                          <Text style={styles.taskSubtext}>{item.description ?? 'No description'}</Text>
+                          <View style={{ flexDirection: 'row', gap: 6, marginTop: 4 }}>
+                            <Text style={styles.projectPill}>
+                              {item.project?.trim() || 'Geen project'}
+                            </Text>
+                            <Text style={styles.folderPill}>
+                              {item.folder_id ? folderNameMap[item.folder_id] ?? 'Onbekende folder' : 'Geen folder'}
+                            </Text>
+                          </View>
+                        </View>
+                      </Pressable>
+                      <Pressable onPress={() => onDelete(item.id)} style={styles.iconButton}>
+                        <Ionicons name="trash-outline" size={16} color="#ef4444" />
+                      </Pressable>
+                    </Animated.View>
+                  ))}
+                </View>
               </Animated.View>
-            )}
-            ListEmptyComponent={
-              <Animated.View style={styles.emptyState} entering={isWeb ? undefined : FadeInDown.duration(200)}>
-                <Ionicons name="sparkles-outline" size={32} color={ACCENT} />
-                <Text style={styles.emptyText}>No tasks yet</Text>
-                <Text style={styles.metaText}>Add your first task to get started.</Text>
-              </Animated.View>
-            }
-          />
+            ))}
+          </View>
         )}
       </Animated.View>
     </View>
@@ -3693,12 +4037,12 @@ function NotesView({
         img.style.width = `${DEFAULT_IMAGE_WIDTH}px`;
         img.style.height = 'auto';
         img.style.float = img.style.float || 'none';
-        img.style.display = img.style.float === 'none' ? 'block' : 'inline-block';
+        img.style.display = 'inline-block';
         img.style.margin = img.style.float === 'left'
-          ? '12px 16px 12px 0'
+          ? '4px 12px 4px 0'
           : img.style.float === 'right'
-            ? '12px 0 12px 16px'
-            : '12px auto';
+            ? '4px 0 4px 12px'
+            : '0 8px';
         img.setAttribute('data-moof-size', '1');
       }
     });
@@ -3711,8 +4055,13 @@ function NotesView({
     const reader = new FileReader();
     reader.onload = () => {
       const dataUrl = reader.result as string;
-      runWebCommand('insertImage', dataUrl);
+      const editor = webEditorRef.current;
+      if (!editor) return;
+      restoreSelection();
+      const html = ` <img src="${dataUrl}" style="max-width:100%; width:${DEFAULT_IMAGE_WIDTH}px; height:auto; display:inline-block; margin:0 8px;" data-moof-size="1" /> `;
+      document.execCommand('insertHTML', false, html);
       ensureWebImageSizing();
+      onChangeNoteBody(editor.innerHTML ?? '');
     };
     reader.readAsDataURL(file);
     e.target.value = '';
@@ -3753,12 +4102,12 @@ function NotesView({
     target.style.width = `${nextWidth}px`;
     target.style.maxWidth = '100%';
     target.style.height = 'auto';
-    target.style.display = target.style.float === 'none' ? 'block' : 'inline-block';
+    target.style.display = 'inline-block';
     target.style.margin = target.style.float === 'left'
       ? '12px 16px 12px 0'
       : target.style.float === 'right'
         ? '12px 0 12px 16px'
-        : '12px auto';
+        : '12px 8px';
     target.setAttribute('data-moof-size', '1');
     if (webEditorRef.current) {
       onChangeNoteBody(webEditorRef.current.innerHTML ?? '');
@@ -3785,8 +4134,8 @@ function NotesView({
       target.style.display = 'inline-block';
     } else {
       target.style.float = 'none';
-      target.style.margin = '12px auto';
-      target.style.display = 'block';
+      target.style.margin = '12px 8px';
+      target.style.display = 'inline-block';
     }
     target.setAttribute('data-moof-size', '1');
     if (webEditorRef.current) {
@@ -4325,6 +4674,21 @@ function NotesView({
                     showsHorizontalScrollIndicator={false}
                     style={{ overflow: 'visible' }}
                     contentContainerStyle={{ gap: 8, paddingVertical: 8 }}>
+                    {/* Clear formatting for selected text */}
+                    <Pressable
+                      style={[styles.toolbarButton]}
+                      onPressIn={(e) => {
+                        e.preventDefault?.();
+                        restoreSelection();
+                        document.execCommand('removeFormat', false);
+                        ensureWebImageSizing();
+                        if (webEditorRef.current) {
+                          onChangeNoteBody(webEditorRef.current.innerHTML ?? '');
+                        }
+                      }}>
+                      <MaterialIcons name="format-clear" size={18} color="#6b7280" />
+                    </Pressable>
+
                     {/* Text Formatting */}
                     <Pressable
                       style={[styles.toolbarButton, webStates.bold && { backgroundColor: '#e5e7ff', borderColor: ACCENT }]}
@@ -5206,18 +5570,20 @@ function NotesView({
                                         <Ionicons name="people" size={12} color="#10b981" />
                                       </View>
                                     )}
-                                    <Pressable
-                                      onPress={(e) => {
-                                        e.stopPropagation();
-                                        setEditingFolder(subfolder);
-                                        setShowEditFolderOverlay(true);
-                                      }}
-                                      style={({ pressed }) => [
-                                        styles.folderEditButton,
-                                        pressed && styles.folderEditButtonPressed,
-                                      ]}>
-                                      <Ionicons name="ellipsis-horizontal" size={18} color="#94a3b8" />
-                                    </Pressable>
+                                    {!isSharedFolder && (
+                                      <Pressable
+                                        onPress={(e) => {
+                                          e.stopPropagation();
+                                          setEditingFolder(subfolder);
+                                          setShowEditFolderOverlay(true);
+                                        }}
+                                        style={({ pressed }) => [
+                                          styles.folderEditButton,
+                                          pressed && styles.folderEditButtonPressed,
+                                        ]}>
+                                        <Ionicons name="ellipsis-horizontal" size={18} color="#94a3b8" />
+                                      </Pressable>
+                                    )}
                                   </View>
                                 </View>
 
@@ -6038,6 +6404,14 @@ const styles = StyleSheet.create({
     color: '#1f2937',
     fontWeight: '600',
   },
+  taskGroup: {
+    gap: 10,
+  },
+  taskGroupHeader: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    justifyContent: 'space-between',
+  },
   taskCard: {
     flexDirection: 'row',
     alignItems: 'center',
@@ -6058,6 +6432,24 @@ const styles = StyleSheet.create({
     fontSize: 16,
     fontWeight: '700',
     color: '#0f172a',
+  },
+  projectPill: {
+    paddingHorizontal: 8,
+    paddingVertical: 4,
+    borderRadius: 8,
+    backgroundColor: '#eef2ff',
+    color: '#4338ca',
+    fontWeight: '700',
+    fontSize: 11,
+  },
+  folderPill: {
+    paddingHorizontal: 8,
+    paddingVertical: 4,
+    borderRadius: 8,
+    backgroundColor: '#ecfeff',
+    color: '#0ea5e9',
+    fontWeight: '700',
+    fontSize: 11,
   },
   taskSubtext: {
     color: MUTED,

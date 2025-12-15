@@ -169,7 +169,7 @@
     max-width: 100% !important;
     height: auto !important;
     display: inline-block !important;
-    margin: 12px auto !important;
+    margin: 12px 8px !important;
     page-break-inside: avoid !important;
   }
 
